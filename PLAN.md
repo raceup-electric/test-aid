@@ -99,15 +99,28 @@ never does.
       commit through the real model (exercises it end to end)
 **Done when:** unit tests green for discovery, submodule enumeration, commit listing. ✅
 
-### Step 3 — Git core: operations
-- [ ] `checkout_oid(repo, oid)` — safe checkout, no force; clear error on dirty conflicts
-- [ ] `set_submodule_pointer(super, path, oid)` — checkout in submodule + `index.add_path`
-      + write index (equivalent of `git add <submodule>`)
-- [ ] List local branches (current marked); `switch_branch(repo, name)` — set HEAD +
-      safe checkout
-- [ ] Tests: setting an older pointer keeps newer commits reachable; dirty tree refused
-      with clear error; branch switch moves HEAD and worktree
-**Done when:** all operation tests green; no history ever rewritten by any op.
+### Step 3 — Git core: operations ✅
+- [x] `src/gitops.rs`: `checkout_oid(repo, oid)` — SAFE checkout (never
+      `--force`), detached HEAD; conflict/exists errors mapped to actionable
+      messages ("commit or stash them first")
+- [x] `set_submodule_pointer(super, path, oid)` — SAFE checkout inside the
+      submodule (detached, like `git submodule update`) + stage the gitlink in
+      the superproject's index (like `git add <submodule>`); clear error when
+      the submodule is not initialized
+- [x] List local branches alphabetical with current marked (`BranchEntry`);
+      `switch_branch(repo, name)` — SAFE checkout + move HEAD to the branch ref
+- [x] Restructured to lib + bin (`src/lib.rs`) so ops are exercisable before
+      the TUI wires them up
+- [x] Tests (8): older pointer keeps newer commits reachable (branch ref +
+      revwalk intact); dirty tree refused with clear error and nothing changed
+      (checked for checkout, submodule pointer, branch switch); branch switch
+      moves HEAD and worktree, works from detached HEAD and as a no-op; unborn
+      HEAD lists no branches
+- [x] Cross-validated against real git on a CLI-created superproject: after
+      `set_submodule_pointer`, `git status` shows `M  sub` (staged),
+      `git diff --cached` shows a clean Subproject-commit transition, and the
+      submodule's branch still points at the newest commit
+**Done when:** all operation tests green; no history ever rewritten by any op. ✅
 
 ### Step 4 — TUI foundation
 - [ ] Terminal init/teardown with panic hook that restores the terminal

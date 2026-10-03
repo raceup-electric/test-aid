@@ -1,17 +1,11 @@
-//! taid — a local-first terminal UI for managing which commits the main
-//! repository records for its submodules.
-//!
-//! Step-2 scaffold: argument handling plus a read-only report produced by
+//! taid's binary: CLI argument handling plus a read-only report produced by
 //! the git model. The interactive UI lands in step 4.
-
-mod gitx;
-
-#[cfg(test)]
-mod fixture;
 
 use std::process::ExitCode;
 
 use anyhow::Context;
+
+use taid::{CommitLog, discover, overview};
 
 const NAME: &str = "taid";
 
@@ -36,7 +30,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Step-2 stub: print what the read-only git model sees in the current
+/// Step-2/3 stub: print what the read-only git model sees in the current
 /// directory, so the model is exercised end to end. The interactive UI
 /// replaces this in step 4.
 fn report_current_repo() -> ExitCode {
@@ -48,7 +42,7 @@ fn report_current_repo() -> ExitCode {
         }
     };
 
-    let repo = match gitx::discover(&cwd).context("looking for a git repository") {
+    let repo = match discover(&cwd).context("looking for a git repository") {
         Ok(Some(repo)) => repo,
         Ok(None) => {
             println!("{NAME}: not a git repository");
@@ -61,7 +55,7 @@ fn report_current_repo() -> ExitCode {
         }
     };
 
-    match gitx::overview(&repo) {
+    match overview(&repo) {
         Ok(ov) => {
             println!("{NAME} — repository at {}", ov.root.display());
             println!("  HEAD: {}", ov.head.describe());
@@ -73,7 +67,7 @@ fn report_current_repo() -> ExitCode {
                 println!("  submodules: {}", names.join(", "));
             }
 
-            let history = gitx::CommitLog::load(&repo, ov.head_oid).and_then(|mut log| {
+            let history = CommitLog::load(&repo, ov.head_oid).and_then(|mut log| {
                 log.ensure_loaded(&repo, 1)?;
                 Ok(log)
             });

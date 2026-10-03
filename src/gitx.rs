@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow};
 use git2::{ErrorCode, Repository, Sort, Status, StatusOptions, Time};
 
 /// File mode of a submodule ("gitlink") entry in a tree.
-const GITLINK_MODE: i32 = 0o160000;
+pub(crate) const GITLINK_MODE: i32 = 0o160000;
 
 /// Discover the repository that contains `start`, walking up like git does.
 ///
