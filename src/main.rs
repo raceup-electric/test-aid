@@ -1,11 +1,10 @@
-//! taid's binary: CLI argument handling plus a read-only report produced by
-//! the git model. The interactive UI lands in step 4.
+//! taid's binary: CLI argument handling + TUI bootstrap.
 
 use std::process::ExitCode;
 
-use anyhow::Context;
-
-use taid::{CommitLog, discover, overview};
+use taid::app::App;
+use taid::gitx::{discover, overview};
+use taid::{event, term};
 
 const NAME: &str = "taid";
 
@@ -13,7 +12,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     match args.as_slice() {
-        [] => report_current_repo(),
+        [] => run_tui(),
         [arg] if arg == "--version" || arg == "-V" => {
             println!("{NAME} {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -30,10 +29,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Step-2/3 stub: print what the read-only git model sees in the current
-/// directory, so the model is exercised end to end. The interactive UI
-/// replaces this in step 4.
-fn report_current_repo() -> ExitCode {
+fn run_tui() -> ExitCode {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(e) => {
@@ -42,55 +38,31 @@ fn report_current_repo() -> ExitCode {
         }
     };
 
-    let repo = match discover(&cwd).context("looking for a git repository") {
-        Ok(Some(repo)) => repo,
-        Ok(None) => {
-            println!("{NAME}: not a git repository");
-            println!("The interactive UI will show a popup for this case (step 4).");
-            return ExitCode::SUCCESS;
-        }
+    // Build the initial state first: even discovery failures become a
+    // popup inside the TUI rather than a bare error on the console.
+    let mut app = match discover(&cwd) {
+        Ok(Some(repo)) => match overview(&repo) {
+            Ok(ov) => App::normal(ov),
+            Err(e) => App::error(&cwd, format!("{e:#}")),
+        },
+        Ok(None) => App::not_repo(&cwd),
+        Err(e) => App::error(&cwd, format!("{e:#}")),
+    };
+
+    term::install_panic_hook();
+    let mut terminal = match term::init() {
+        Ok(t) => t,
         Err(e) => {
             eprintln!("{NAME}: {e:#}");
             return ExitCode::FAILURE;
         }
     };
 
-    match overview(&repo) {
-        Ok(ov) => {
-            println!("{NAME} — repository at {}", ov.root.display());
-            println!("  HEAD: {}", ov.head.describe());
-            println!("  worktree: {}", if ov.dirty { "dirty" } else { "clean" });
-            if ov.submodules.is_empty() {
-                println!("  submodules: none");
-            } else {
-                let names: Vec<&str> = ov.submodules.iter().map(|s| s.name.as_str()).collect();
-                println!("  submodules: {}", names.join(", "));
-            }
+    let result = event::run(&mut app, &mut terminal);
+    term::restore(&mut terminal);
 
-            let history = CommitLog::load(&repo, ov.head_oid).and_then(|mut log| {
-                log.ensure_loaded(&repo, 1)?;
-                Ok(log)
-            });
-            match history {
-                Ok(log) if log.is_empty() => println!("  history: no commits yet"),
-                Ok(log) => {
-                    if let Some(c) = log.get(0) {
-                        println!(
-                            "  history: {} commits; newest: {} {} {} {} — {}",
-                            log.len(),
-                            c.oid,
-                            c.short_sha,
-                            c.time_str(),
-                            c.author_name,
-                            c.title
-                        );
-                    }
-                }
-                Err(e) => println!("  history: unavailable ({e})"),
-            }
-            println!("The interactive UI lands in step 4.");
-            ExitCode::SUCCESS
-        }
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{NAME}: {e:#}");
             ExitCode::FAILURE

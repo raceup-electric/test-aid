@@ -23,6 +23,10 @@ git2 = { version = "0.20", default-features = false, features = ["vendored-libgi
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
+[dev-dependencies]
+# Integration tests drive the real binary in a pseudo-terminal
+portable-pty = "0.8"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

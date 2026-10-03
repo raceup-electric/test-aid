@@ -6,19 +6,21 @@
 //!   snapshot, commit history
 //! - [`gitops`]: the mutating operations — safe checkout, submodule pointer
 //!   staging, branch switching. All strictly local and non-destructive:
-//!   nothing is fetched, pushed, or rewritten.
-//!
-//! This crate exists as a library so the operations can be exercised by
-//! tests (and, soon, the TUI) while `src/main.rs` stays a thin binary.
+//!   nothing is fetched, pushed, or rewritten
+//! - [`app`]: terminal-free TUI state machine (modes, focus, popups, input)
+//! - [`ui`]: renders `app` state and registers clickable regions
+//! - [`event`]: the input loop that ties them together
+//! - [`term`]: terminal lifecycle (alternate screen, raw mode, panic hook)
 
+pub mod app;
+pub mod event;
 pub mod gitops;
 pub mod gitx;
+pub mod term;
 
-#[cfg(test)]
-mod fixture;
+mod ui;
 
-pub use gitops::{BranchEntry, branches, checkout_oid, set_submodule_pointer, switch_branch};
-pub use gitx::{
-    CommitInfo, CommitLog, HeadInfo, RepoOverview, SubmoduleEntry, discover, head_info, is_dirty,
-    overview,
-};
+/// Test fixtures: real repositories built with the git2 API. Exposed for
+/// the integration tests in `tests/`; not part of the public interface.
+#[doc(hidden)]
+pub mod fixture;

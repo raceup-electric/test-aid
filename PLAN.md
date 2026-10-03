@@ -122,15 +122,29 @@ never does.
       submodule's branch still points at the newest commit
 **Done when:** all operation tests green; no history ever rewritten by any op. ✅
 
-### Step 4 — TUI foundation
-- [ ] Terminal init/teardown with panic hook that restores the terminal
-- [ ] Event loop (keyboard + mouse), resize handling
-- [ ] Base layout: header (repo root, main branch, dirty flag), left repo list,
-      right pane placeholder, footer keymap bar
-- [ ] Focus cycling between panes; `?` help popup; `q`/`Esc` quits
-- [ ] Non-repo case: centered popup with message + clickable **OK** button → exits
+### Step 4 — TUI foundation ✅
+- [x] `src/term.rs`: terminal init/teardown (alternate screen, raw mode,
+      mouse capture) + panic hook that restores the terminal BEFORE the
+      panic message prints; no-tty fails with a clear message
+- [x] `src/event.rs`: event loop (keyboard + mouse, resize; Ctrl+C always quits)
+- [x] `src/app.rs`: terminal-free state machine — modes (Normal/NotRepo/Error),
+      focus cycling, ScrollState with paging/clamping/ensure_visible,
+      popups, hit-zone routing for clicks
+- [x] `src/ui.rs`: base layout — header (repo root, branch/detached, dirty
+      flag), left repo list (main + submodules with state), right pane
+      placeholder, footer keymap; `?` help popup; not-repo/error popup with
+      clickable [ OK ] button; renderer registers hit zones each frame
+- [x] Hardening: zero-sized and tiny terminals cannot panic (0×0 ptys found
+      via testing; regression-tested with TestBackend)
+- [x] `tests/pty.rs`: real pty integration tests (portable-pty) driving the
+      actual binary in an 80×24 pty with timeouts and output assertions:
+      q quits, OK popup + Enter exits, panic restores before printing.
+      Replaced the earlier script/printf approach (fragile, 0×0 ptys, could
+      leak mouse-tracking into the host terminal when interrupted)
+- [x] Found & fixed via pty testing: input sent before raw mode is on gets
+      CR→NL-translated (harness waits for the first frame before sending)
 **Done when:** runs correctly in both a repo and a non-repo dir; terminal restored
-after exit and after an induced panic.
+after exit and after an induced panic. ✅ (36 unit tests + 3 pty tests)
 
 ### Step 5 — Commit browsing UX
 - [ ] Left pane: real entries (main repo first; per entry: name, recorded sha,
