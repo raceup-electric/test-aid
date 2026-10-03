@@ -72,13 +72,13 @@ Each step ends with one or more commits, so every point is independently reviewa
 and revertable. Tests may use the `git` CLI to build fixtures; the shipped binary
 never does.
 
-### Step 1 — Project scaffold
-- [ ] `cargo init --name taid`; `Cargo.toml` deps: `ratatui`, `crossterm`, `git2`
-      (default-features off, vendored libgit2, **no** ssh/https/openssl), `anyhow`,
-      `chrono` (minimal features)
-- [ ] Verify with `cargo tree` that no `openssl-sys`/`libssh2-sys` is pulled in
-- [ ] Minimal `main.rs`: handle `--version` / `--help` and exit cleanly (no TUI yet)
-- [ ] README stub, LICENSE (MIT)
+### Step 1 — Project scaffold ✅
+- [x] `Cargo.toml` deps: `ratatui` 0.29, `crossterm` 0.28 (unified with ratatui's),
+      `git2` 0.20 (default-features off, vendored libgit2, **no** ssh/https/openssl),
+      `anyhow`, `chrono` (std only). Edition 2024, MSRV 1.85.
+- [x] Verified with `cargo tree`: no `openssl-sys`, no `libssh2-sys`, single crossterm
+- [x] Minimal `main.rs`: `--version` / `--help` handled, exit cleanly (no TUI yet)
+- [x] README stub, LICENSE (MIT)
 - [ ] `cargo build` + `cargo clippy -D warnings` clean
 **Done when:** `./target/debug/taid --version` prints the version; build has zero warnings.
 

@@ -1,0 +1,29 @@
+[package]
+name = "taid"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A local-first TUI to manage which commits your repository records for its submodules"
+license = "MIT"
+readme = "README.md"
+keywords = ["git", "submodules", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
+
+[dependencies]
+# TUI stack
+ratatui = "0.29"
+# 0.28 to match the version ratatui 0.29 uses (avoids two crossterm copies)
+crossterm = "0.28"
+
+# Git operations via vendored libgit2: statically linked into the binary,
+# with no ssh/https features so nothing can ever touch the network.
+git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
+
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
