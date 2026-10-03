@@ -82,15 +82,22 @@ never does.
 - [ ] `cargo build` + `cargo clippy -D warnings` clean
 **Done when:** `./target/debug/taid --version` prints the version; build has zero warnings.
 
-### Step 2 — Git core: read-only model
-- [ ] `src/gitx.rs`: discover repo walking up from cwd (expose root path)
-- [ ] Repo introspection: current branch or detached sha, clean/dirty flag
-- [ ] Submodule enumeration: name, path, recorded OID (index), workdir OID,
-      initialized?, clean/dirty, branch
-- [ ] Commit log: oid, short sha, title, author, unix time + UTC offset (lazy paging,
-      ~500 commits per chunk)
-- [ ] Fixture-based unit tests (temp repos created programmatically)
-**Done when:** unit tests green for discovery, submodule enumeration, commit listing.
+### Step 2 — Git core: read-only model ✅
+- [x] `src/gitx.rs`: discover repo walking up from cwd (expose root path);
+      `Ok(None)` cleanly means "not a git repository"
+- [x] Repo introspection: current branch or detached sha (or unborn HEAD),
+      clean/dirty flag (untracked files count, matches `git status`)
+- [x] Submodule enumeration: name, path, recorded OID (HEAD tree) and staged OID
+      (index), workdir OID, initialized?, clean/dirty, HEAD state, workdir path
+- [x] Commit log: oid, git-style short sha, title, author, unix time + UTC
+      offset, formatted `YYYY-MM-DD HH:MM` in the commit's own timezone;
+      lazy materialization (`ensure_loaded`) with all oids collected up front
+- [x] Fixture-based unit tests: real repos built with git2 only (no git CLI,
+      no network); superproject fixture with matching / ahead / uninitialized
+      submodules
+- [x] CLI stub now reports discovery, HEAD, dirtiness, submodules and newest
+      commit through the real model (exercises it end to end)
+**Done when:** unit tests green for discovery, submodule enumeration, commit listing. ✅
 
 ### Step 3 — Git core: operations
 - [ ] `checkout_oid(repo, oid)` — safe checkout, no force; clear error on dirty conflicts
