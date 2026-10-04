@@ -221,6 +221,23 @@ fn outside_a_repo_shows_popup_and_ok_exits() -> TestResult {
 }
 
 #[test]
+fn picking_a_commit_marks_it_and_quits() -> TestResult {
+    let (_temp, root) = super_repo("pty-pick")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Tab → commits pane, j → older commit, Enter → pick it, q → quit.
+    session.send("\tj\rq")?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit on its own after q");
+    assert!(status.success(), "raw output: {raw:?}");
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(screen.contains('✓'), "pick marker rendered: {screen:?}");
+    assert!(screen.contains("pick"), "pick summary rendered");
+    Ok(())
+}
+
+#[test]
 fn panic_restores_the_terminal_before_printing() -> TestResult {
     if !cfg!(debug_assertions) {
         // The TAID_PANIC_TEST hook only exists in debug builds.

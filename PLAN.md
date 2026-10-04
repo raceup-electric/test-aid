@@ -146,17 +146,26 @@ never does.
 **Done when:** runs correctly in both a repo and a non-repo dir; terminal restored
 after exit and after an induced panic. ✅ (36 unit tests + 3 pty tests)
 
-### Step 5 — Commit browsing UX
-- [ ] Left pane: real entries (main repo first; per entry: name, recorded sha,
-      dirty marker, `not initialized` badge)
-- [ ] Right pane: repo summary (path, branch, clean/dirty, recorded vs workdir sha)
-      + commit list rows `● <short sha> <date time> <title>`
-      (`●` = current recorded/HEAD, `✓` = pending pick)
-- [ ] Scrolling (arrows/vi keys/PgUp/PgDn/Home/End), `Enter` toggles the pick
-- [ ] Adaptive single-pane layout when the repo has no submodules
-- [ ] `r` refresh; lazy-load more commits when scrolling hits the bottom
+### Step 5 — Commit browsing UX ✅
+- [x] Left pane: main repo first; per entry: name, recorded sha, `≠ workdir`
+      drift marker, `✓` pending-pick badge, dirty marker, `not initialized` badge
+- [x] Right pane: 2-line summary (identity · HEAD · recorded/current vs workdir ·
+      clean/dirty · pick line) + commit list rows `marker short-sha date+time title`
+      with `●` = recorded/current, `○` = submodule's checkout, `✓` = pending pick
+- [x] Scrolling (arrows/vi keys/PgUp/PgDn/Home/End) + mouse wheel; `Enter` toggles
+      the pick (picking the current commit is a no-op); click selects rows
+- [x] Adaptive single-pane layout when the repo has no submodules (focus locked
+      to the commit list)
+- [x] `r` refresh — rebuilds state from disk, picks survive (keyed by main/sub
+      path), histories reload lazily; lazy materialization: 60 rows on open, +40
+      ahead of the viewport while scrolling (verified with a 200-commit repo)
+- [x] Histories walk HEAD **plus all local branches** so newer commits stay
+      visible/selectable even after moving HEAD back (never a dead end)
+- [x] Bugs found by tests & fixed: commit cursor moved before the entry's history
+      loaded (first Down landed on row 0); clicking a commit row hit the pane
+      zone first (hit-test now picks the smallest containing region)
 **Done when:** listing matches `git log --oneline` ground truth in a fixture repo;
-markers and layout correct.
+markers and layout correct. ✅ (50 unit + 4 pty tests)
 
 ### Step 6 — Branch switcher
 - [ ] `b` opens a popup for the repo selected in the left pane

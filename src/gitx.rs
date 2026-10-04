@@ -237,17 +237,31 @@ pub struct CommitLog {
 }
 
 impl CommitLog {
-    /// Load the history reachable from `tip`, newest first. Pass `None` for
-    /// a repository without commits (e.g. HEAD is unborn) to get an empty log.
-    pub fn load(repo: &Repository, tip: Option<git2::Oid>) -> Result<Self> {
-        let Some(tip) = tip else {
-            return Ok(Self {
-                oids: Vec::new(),
-                commits: Vec::new(),
-            });
-        };
+    /// An empty log (no commits / nothing browsable).
+    pub fn empty() -> Self {
+        Self {
+            oids: Vec::new(),
+            commits: Vec::new(),
+        }
+    }
+
+    /// Load the history reachable from any of `tips`, newest first.
+    ///
+    /// Walking from several tips at once (typically HEAD plus every local
+    /// branch) keeps commits visible even when HEAD has been moved to an
+    /// older commit — newer commits on branches are never hidden, so the
+    /// user can always pick their way back to the tip.
+    pub fn load_from(repo: &Repository, tips: &[git2::Oid]) -> Result<Self> {
         let mut walk = repo.revwalk()?;
-        walk.push(tip)?;
+        let mut pushed = false;
+        for tip in tips {
+            if walk.push(*tip).is_ok() {
+                pushed = true;
+            }
+        }
+        if !pushed {
+            return Ok(Self::empty());
+        }
         walk.set_sorting(Sort::TIME)?;
         let mut oids = Vec::new();
         for oid in walk {
@@ -257,6 +271,12 @@ impl CommitLog {
             oids,
             commits: Vec::new(),
         })
+    }
+
+    /// Load the history reachable from `tip`, newest first. Pass `None` for
+    /// a repository without commits (e.g. HEAD is unborn) to get an empty log.
+    pub fn load(repo: &Repository, tip: Option<git2::Oid>) -> Result<Self> {
+        Self::load_from(repo, tip.as_slice())
     }
 
     /// Total number of commits in the loaded history.
@@ -293,11 +313,42 @@ impl CommitLog {
     pub fn get(&self, index: usize) -> Option<&CommitInfo> {
         self.commits.get(index)
     }
+
+    /// How many rows have been materialized so far (≤ `len`).
+    pub fn materialized(&self) -> usize {
+        self.commits.len()
+    }
+
+    /// Find a materialized commit by oid (used to describe picks).
+    pub fn find(&self, oid: git2::Oid) -> Option<&CommitInfo> {
+        self.commits.iter().find(|c| c.oid == oid)
+    }
 }
 
 fn short_sha(commit: &git2::Commit) -> Result<String> {
     let buf = commit.as_object().short_id()?;
     Ok(buf.as_str().map(str::to_string).unwrap_or_default())
+}
+
+/// Tips whose history should be listed: HEAD plus every local branch.
+///
+/// Including branches (not just HEAD) means the log never "loses" newer
+/// commits after HEAD is moved onto an older one.
+pub fn history_tips(repo: &Repository) -> Vec<git2::Oid> {
+    let mut tips = Vec::new();
+    if let Ok(head) = repo.head() {
+        if let Some(target) = head.target() {
+            tips.push(target);
+        }
+    }
+    if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+        for (branch, _) in branches.flatten() {
+            if let Some(target) = branch.get().target() {
+                tips.push(target);
+            }
+        }
+    }
+    tips
 }
 
 #[cfg(test)]
@@ -483,5 +534,30 @@ mod tests {
         };
         // 2023-11-14 22:13:20 UTC, shown at +01:00
         assert_eq!(info.time_str(), "2023-11-14 23:13");
+    }
+
+    #[test]
+    fn history_tips_keep_branch_commits_visible_behind_head() -> Result<()> {
+        let temp = TempDir::new("tips")?;
+        let (repo, oids) = fixture::make_history(&temp.path().join("repo"), &["c1", "c2"])?;
+        let first = repo.find_commit(oids[0])?;
+        repo.branch("feature", &first, false)?;
+
+        // HEAD detached on the older commit: a HEAD-only walk would hide c2.
+        repo.set_head_detached(oids[0])?;
+        let tips = history_tips(&repo);
+        assert!(tips.contains(&oids[0]));
+        assert!(tips.contains(&oids[1]));
+
+        let mut log = CommitLog::load_from(&repo, &tips)?;
+        log.ensure_loaded(&repo, usize::MAX)?;
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.get(0).map(|c| c.oid), Some(oids[1]));
+
+        // No tips at all (unborn HEAD, no branches) → empty log.
+        let fresh = fixture::init_repo(&temp.path().join("fresh"), "main")?;
+        assert!(history_tips(&fresh).is_empty());
+        assert!(CommitLog::load_from(&fresh, &[])?.is_empty());
+        Ok(())
     }
 }

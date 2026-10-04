@@ -4,6 +4,8 @@
 //! every frame, so the event loop can route mouse clicks without duplicating
 //! layout math.
 
+use std::borrow::Cow;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -99,7 +101,8 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
     );
 }
 
-/// The main two-pane screen: header, repo list, commit pane, footer.
+/// The main screen. Two panes when the repository has submodules (repo list
+/// + commit browser); a single full-width commit browser otherwise.
 fn draw_normal(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let rows = Layout::vertical([
@@ -111,9 +114,13 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
     draw_header(f, app, rows[0]);
     draw_footer(f, app, rows[2]);
 
-    let panes = Layout::horizontal([Constraint::Max(34), Constraint::Min(24)]).split(rows[1]);
-    draw_repos_pane(f, app, panes[0]);
-    draw_commits_pane(f, app, panes[1]);
+    if app.has_submodules() {
+        let panes = Layout::horizontal([Constraint::Max(34), Constraint::Min(24)]).split(rows[1]);
+        draw_repos_pane(f, app, panes[0]);
+        draw_commits_pane(f, app, panes[1]);
+    } else {
+        draw_commits_pane(f, app, rows[1]);
+    }
 
     if app.popup == Some(Popup::Help) {
         draw_help(f, area);
@@ -154,8 +161,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let text = if app.popup.is_some() {
         " Esc — close "
+    } else if app.has_submodules() {
+        " ↑↓/jk move · Tab/←→ panes · Enter pick · r refresh · ? help · q quit "
     } else {
-        " ↑↓/jk select · Tab/←→ panes · ? help · q quit "
+        " ↑↓/jk move · Enter pick · r refresh · ? help · q quit "
     };
     f.render_widget(Paragraph::new(text).dim(), area);
 }
@@ -184,26 +193,50 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
     for row in 0..count {
         let idx = offset + row;
         let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let pick = app.entries.get(idx).and_then(|e| e.pick);
         let line = match app::entry_at(ov, idx) {
-            Some(Entry::Main(m)) => Line::from(vec![
-                Span::styled(
-                    root_name(&m.root),
-                    Style::new().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::styled(head_short(&m.head), Style::new().fg(Color::DarkGray)),
-                dirty_span(m.dirty),
-            ]),
+            Some(Entry::Main(m)) => {
+                let mut spans = vec![
+                    Span::styled(
+                        root_name(&m.root),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(head_short(&m.head), Style::new().fg(Color::DarkGray)),
+                ];
+                if pick.is_some() {
+                    spans.push(Span::styled(
+                        " ✓",
+                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                spans.push(dirty_span(m.dirty));
+                Line::from(spans)
+            }
             Some(Entry::Sub(sm)) => {
-                let status = if sm.initialized {
-                    match &sm.head {
-                        Some(h) => Span::styled(head_short(h), Style::new().fg(Color::DarkGray)),
-                        None => Span::styled("?", Style::new().fg(Color::DarkGray)),
-                    }
+                let mut spans = vec![Span::raw(sm.name.clone()), Span::raw("  ")];
+                if !sm.initialized {
+                    spans.push(Span::styled("not initialized", Style::new().fg(Color::Red)));
                 } else {
-                    Span::styled("not initialized", Style::new().fg(Color::Red))
-                };
-                let mut spans = vec![Span::raw(sm.name.clone()), Span::raw("  "), status];
+                    match sm.recorded_oid {
+                        Some(r) => {
+                            spans.push(Span::styled(short_oid(r), Style::new().fg(Color::Yellow)))
+                        }
+                        None => spans.push(Span::styled("?", Style::new().fg(Color::DarkGray))),
+                    }
+                    if sm.recorded_oid != sm.workdir_oid {
+                        if let Some(w) = sm.workdir_oid {
+                            spans.push(dim(" ≠"));
+                            spans.push(Span::styled(short_oid(w), Style::new().fg(Color::Cyan)));
+                        }
+                    }
+                }
+                if pick.is_some() {
+                    spans.push(Span::styled(
+                        " ✓",
+                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    ));
+                }
                 if sm.dirty == Some(true) {
                     spans.push(dirty_span(true));
                 }
@@ -227,75 +260,222 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
     app.hit_zones.push((area, Hit::PaneRepos));
 }
 
-/// Placeholder commit pane: summary of the selected entry until the commit
-/// browser lands in step 5.
+/// The commit browser: a two-line summary of the selected entry plus its
+/// commit history, newest first.
 fn draw_commits_pane(f: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Commits;
-    let block = Block::bordered()
-        .title(" Commits ")
-        .border_style(pane_border(focused));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-    app.pane_heights.commits = inner.height as usize;
-    app.hit_zones.push((area, Hit::PaneCommits));
-
-    let Some(ov) = &app.overview else {
+    if area.width < 8 || area.height < 3 {
         return;
-    };
-    let mut lines = match app::entry_at(ov, app.repos.selected()) {
-        Some(Entry::Main(m)) => vec![
-            kv("repository", m.root.display().to_string()),
-            kv("HEAD", m.head.describe()),
-            kv(
-                "status",
-                if m.dirty { "dirty" } else { "clean" }.to_string(),
-            ),
-        ],
-        Some(Entry::Sub(sm)) => {
-            let head = if !sm.initialized {
-                "not initialized".to_string()
-            } else {
-                sm.head
-                    .as_ref()
-                    .map(|h| h.describe())
-                    .unwrap_or_else(|| "?".to_string())
-            };
-            vec![
-                kv("submodule", sm.name.clone()),
-                kv("path", sm.path.clone()),
-                kv("HEAD", head),
-                kv(
-                    "recorded",
-                    sm.recorded_oid.map(short_oid).unwrap_or_else(|| "—".into()),
-                ),
-                kv(
-                    "staged",
-                    sm.index_oid.map(short_oid).unwrap_or_else(|| "—".into()),
-                ),
-                kv(
-                    "workdir",
-                    sm.workdir_oid.map(short_oid).unwrap_or_else(|| "—".into()),
-                ),
-                kv(
-                    "status",
-                    match sm.dirty {
-                        Some(true) => "dirty".to_string(),
-                        Some(false) => "clean".to_string(),
-                        None => "—".to_string(),
-                    },
-                ),
-            ]
-        }
-        None => vec![],
-    };
-    lines.push(Line::from(""));
-    lines.push(Line::from("commit browser lands in step 5 — press ? for keys").dim());
+    }
+    let focused = app.focus == Focus::Commits;
+    let selected = app.repos.selected();
 
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
+    let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
+    let summary = summary_lines(app);
+    f.render_widget(
+        Paragraph::new(summary).wrap(Wrap { trim: false }),
+        chunks[0],
+    );
+
+    let (title, empty_msg) = list_meta(app, selected);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(pane_border(focused));
+    let inner = block.inner(chunks[1]);
+
+    // Gather rows (immutable borrow of app), then render and register zones.
+    struct RowDraw {
+        line: Line<'static>,
+        selected: bool,
+        index: usize,
+    }
+    let rows: Vec<RowDraw> = match app.entries.get(selected) {
+        None => Vec::new(),
+        Some(entry) => {
+            let recorded = app.current_oid(selected);
+            let workdir = app.workdir_oid(selected);
+            let (offset, count) = entry.scroll.visible(inner.height as usize);
+            (offset..offset + count)
+                .map(|i| {
+                    let is_selected = entry.scroll.selected() == i;
+                    match entry.log.get(i) {
+                        Some(c) => {
+                            let (marker, color) = if entry.pick == Some(c.oid) {
+                                ('✓', Color::Green)
+                            } else if recorded == Some(c.oid) {
+                                ('●', Color::Yellow)
+                            } else if selected > 0 && Some(c.oid) == workdir {
+                                ('○', Color::DarkGray)
+                            } else {
+                                (' ', Color::Reset)
+                            };
+                            let line = Line::from(vec![
+                                Span::styled(marker.to_string(), Style::new().fg(color)),
+                                Span::raw(" "),
+                                Span::styled(c.short_sha.clone(), Style::new().fg(Color::Yellow)),
+                                Span::raw(" "),
+                                Span::styled(c.time_str(), Style::new().fg(Color::DarkGray)),
+                                Span::raw(" "),
+                                Span::raw(c.title.clone()),
+                            ]);
+                            RowDraw {
+                                line,
+                                selected: is_selected,
+                                index: i,
+                            }
+                        }
+                        None => RowDraw {
+                            line: Line::from("…").dim(),
+                            selected: is_selected,
+                            index: i,
+                        },
+                    }
+                })
+                .collect()
+        }
+    };
+
+    f.render_widget(block, chunks[1]);
+    app.pane_heights.commits = inner.height as usize;
+    app.hit_zones.push((chunks[1], Hit::PaneCommits));
+
+    if let Some(msg) = empty_msg {
+        f.render_widget(Paragraph::new(msg).dim().wrap(Wrap { trim: true }), inner);
+        return;
+    }
+
+    for (row, r) in rows.into_iter().enumerate() {
+        let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let style = if r.selected {
+            if focused {
+                Style::new().bg(Color::Cyan).fg(Color::Black)
+            } else {
+                Style::new().bg(Color::DarkGray)
+            }
+        } else {
+            Style::new()
+        };
+        f.render_widget(Paragraph::new(r.line).style(style), rect);
+        app.hit_zones.push((rect, Hit::CommitRow(r.index)));
+    }
+}
+
+/// Title and, when there is nothing to browse, an explanatory message.
+fn list_meta(app: &App, idx: usize) -> (String, Option<String>) {
+    let Some(ov) = &app.overview else {
+        return (String::new(), None);
+    };
+    let total = app.entries.get(idx).map(|e| e.log.len()).unwrap_or(0);
+    match app::entry_at(ov, idx) {
+        Some(Entry::Main(m)) => (
+            format!(" History — {} ({total}) ", root_name(&m.root)),
+            (total == 0).then(|| "no commits yet".to_string()),
+        ),
+        Some(Entry::Sub(sm)) if !sm.initialized => (
+            format!(" History — {} ({total}) ", sm.name),
+            Some(format!(
+                "submodule not initialized — nothing to browse\nrun: git submodule update --init {}",
+                sm.path
+            )),
+        ),
+        Some(Entry::Sub(sm)) => (
+            format!(" History — {} ({total}) ", sm.name),
+            (total == 0).then(|| "no commits yet".to_string()),
+        ),
+        None => (String::new(), None),
+    }
+}
+
+/// Two summary lines for the selected entry: identity/state, then the pick.
+fn summary_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(ov) = &app.overview else {
+        return vec![Line::from(""), Line::from("")];
+    };
+    let idx = app.repos.selected();
+
+    let first: Vec<Span<'static>> = match app::entry_at(ov, idx) {
+        Some(Entry::Main(m)) => vec![
+            Span::styled(
+                root_name(&m.root),
+                Style::new().add_modifier(Modifier::BOLD),
+            ),
+            dim(" · "),
+            head_span(&m.head),
+            dim(" · "),
+            status_span(m.dirty),
+        ],
+        Some(Entry::Sub(sm)) if sm.initialized => {
+            let mut spans = vec![
+                Span::styled(sm.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                dim(" (submodule) · "),
+            ];
+            if let Some(h) = &sm.head {
+                spans.push(head_span(h));
+                spans.push(dim(" · "));
+            }
+            let current = app.current_oid(idx);
+            let workdir = app.workdir_oid(idx);
+            if current != workdir {
+                if let Some(c) = current {
+                    spans.push(dim("rec "));
+                    spans.push(Span::styled(short_oid(c), Style::new().fg(Color::Yellow)));
+                }
+                if let Some(w) = workdir {
+                    spans.push(dim(" ≠ wd "));
+                    spans.push(Span::styled(short_oid(w), Style::new().fg(Color::Cyan)));
+                }
+                spans.push(dim(" · "));
+            } else if let Some(c) = current {
+                spans.push(Span::styled(short_oid(c), Style::new().fg(Color::Yellow)));
+                spans.push(dim(" · "));
+            }
+            spans.push(status_span(sm.dirty.unwrap_or(false)));
+            spans
+        }
+        Some(Entry::Sub(sm)) => vec![
+            Span::styled(sm.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+            dim(" (submodule) · "),
+            Span::styled("not initialized", Style::new().fg(Color::Red)),
+            dim(" · "),
+            dim(format!(
+                "recorded {}",
+                sm.recorded_oid
+                    .map(short_oid)
+                    .unwrap_or_else(|| "—".to_string())
+            )),
+        ],
+        None => Vec::new(),
+    };
+    vec![Line::from(first), pick_line(app, idx)]
+}
+
+/// The second summary line: the pending pick, or blank.
+fn pick_line(app: &App, idx: usize) -> Line<'static> {
+    let Some(oid) = app.entries.get(idx).and_then(|e| e.pick) else {
+        return Line::from("");
+    };
+    let mut spans = vec![Span::styled(
+        "✓ pick",
+        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+    )];
+    spans.push(Span::styled(
+        format!(" {}", short_oid(oid)),
+        Style::new().fg(Color::Yellow),
+    ));
+    match app.entries.get(idx).and_then(|e| e.log.find(oid)) {
+        Some(c) => {
+            spans.push(Span::styled(
+                format!("  {}", c.time_str()),
+                Style::new().fg(Color::DarkGray),
+            ));
+            spans.push(Span::raw(format!("  {}", c.title)));
+        }
+        None => spans.push(dim("  (beyond loaded history)")),
+    }
+    Line::from(spans)
 }
 
 fn draw_help(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(62, 70, area);
+    let popup = centered_rect(70, 90, area);
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .title(" Help ")
@@ -305,10 +485,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
 
     let keys: &[(&str, &str)] = &[
         ("↑ ↓ / k j", "move selection"),
-        ("PgUp PgDn", "scroll by page"),
-        ("Home End", "first / last row"),
+        ("PgUp PgDn / Home End", "scroll by page / first-last"),
         ("Tab / Shift+Tab", "switch pane (repos ↔ commits)"),
-        ("mouse click", "focus panes, select rows, press buttons"),
+        (
+            "Enter",
+            "pick / un-pick the commit the main repository records",
+        ),
+        ("r", "refresh repository state"),
+        ("click / wheel", "select rows, focus panes, scroll"),
         ("?", "toggle this help"),
         ("q / Esc", "quit (or close a popup)"),
     ];
@@ -318,23 +502,42 @@ fn draw_help(f: &mut Frame, area: Rect) {
     ];
     for (k, d) in keys {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<18}"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("  {k:<22}"), Style::new().fg(Color::Cyan)),
             Span::raw(*d),
         ]));
     }
     lines.push(Line::from(""));
-    lines.push(Line::from("  ● marks a dirty working tree").dim());
+    lines.push(Line::from("Markers"));
+    lines.push(Line::from("  ● recorded / current commit"));
+    lines.push(Line::from("  ○ where the submodule's working directory is"));
+    lines.push(Line::from("  ✓ your pick"));
     lines.push(
         Line::from("  taid is strictly local: nothing is fetched, pushed or committed.").dim(),
     );
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
-fn kv(k: &str, v: impl Into<String>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{k:<10}"), Style::new().fg(Color::DarkGray)),
-        Span::raw(v.into()),
-    ])
+fn dim(s: impl Into<Cow<'static, str>>) -> Span<'static> {
+    Span::styled(s, Style::new().fg(Color::DarkGray))
+}
+
+fn head_span(h: &HeadInfo) -> Span<'static> {
+    match h {
+        HeadInfo::Branch(b) => Span::styled(b.clone(), Style::new().fg(Color::Green)),
+        HeadInfo::Detached(oid) => Span::styled(
+            format!("{} (detached)", short_oid(*oid)),
+            Style::new().fg(Color::Yellow),
+        ),
+        HeadInfo::Unborn(_) => Span::styled("no commits yet", Style::new().fg(Color::DarkGray)),
+    }
+}
+
+fn status_span(dirty: bool) -> Span<'static> {
+    if dirty {
+        Span::styled("● dirty", Style::new().fg(Color::Red))
+    } else {
+        Span::styled("clean", Style::new().fg(Color::Green))
+    }
 }
 
 fn dirty_span(dirty: bool) -> Span<'static> {
@@ -348,7 +551,7 @@ fn dirty_span(dirty: bool) -> Span<'static> {
 fn head_short(head: &HeadInfo) -> String {
     match head {
         HeadInfo::Branch(b) => b.clone(),
-        HeadInfo::Detached(oid) => oid.to_string()[..7].to_string(),
+        HeadInfo::Detached(oid) => short_oid(*oid),
         HeadInfo::Unborn(_) => "no commits".to_string(),
     }
 }
@@ -391,10 +594,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, Hit, Popup};
+    use crate::app::{App, Focus, Hit, Popup};
     use crate::fixture::{self, SubSpec, TempDir};
     use crate::gitx;
-    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::Path;
@@ -437,7 +640,11 @@ mod tests {
         )
         .unwrap();
         let ov = gitx::overview(&sup.repo).unwrap();
-        (App::normal(ov), temp)
+        (App::normal(ov, sup.repo), temp)
+    }
+
+    fn key(code: KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
     }
 
     fn click(col: u16, row: u16) -> MouseEvent {
@@ -495,7 +702,84 @@ mod tests {
         assert!(text.contains("not initialized"));
         assert!(text.contains("main"), "branch name shown");
         assert!(text.contains('●'), "dirty marker (subC is uninitialized)");
-        assert!(text.contains("Commits"), "right pane title");
+        assert!(text.contains("History"), "commit pane title");
+    }
+
+    #[test]
+    fn commit_rows_render_with_markers() {
+        let temp = TempDir::new("ui-markers").unwrap();
+        let sup = fixture::make_super(
+            &temp.path().join("super"),
+            &[SubSpec {
+                name: "subX",
+                msgs: &["x1", "x2"],
+                recorded: Some(0), // recorded is the OLDER commit
+                drop_workdir: false,
+            }],
+        )
+        .unwrap();
+        let ov = gitx::overview(&sup.repo).unwrap();
+        let mut app = App::normal(ov, sup.repo);
+        app.select_repo(1); // subX
+
+        let buf = render(&mut app, 100, 30);
+        let text = screen_text(&buf);
+
+        assert!(text.contains("x1") && text.contains("x2"), "titles: {text}");
+        assert!(text.contains('●'), "recorded marker on x1");
+        assert!(text.contains('○'), "workdir marker on x2");
+        assert!(
+            text.contains("rec") && text.contains("≠"),
+            "drift in summary"
+        );
+        assert!(text.contains("2023-11-14 23:13"), "x1 timestamp: {text}");
+        assert!(text.contains("2023-11-15 00:13"), "x2 timestamp: {text}");
+    }
+
+    #[test]
+    fn pick_marker_and_summary_render() {
+        let (mut app, _t) = make_normal_app();
+        app.select_repo(1); // subA
+        app.focus = Focus::Commits;
+        app.handle_key(key(KeyCode::Down)); // older commit (a1)
+        app.handle_key(key(KeyCode::Enter)); // pick it
+
+        let buf = render(&mut app, 100, 30);
+        let text = screen_text(&buf);
+        assert!(text.contains('✓'), "pick marker: {text}");
+        assert!(text.contains("pick"), "pick summary line");
+        assert!(text.contains("a1"), "picked title in summary");
+    }
+
+    #[test]
+    fn single_pane_without_submodules() {
+        let temp = TempDir::new("ui-single").unwrap();
+        let (repo, _) = fixture::make_history(&temp.path().join("r"), &["c1"]).unwrap();
+        let ov = gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(!text.contains("Repos"), "no repo pane: {text}");
+        assert!(text.contains("History — r (1)"), "history title: {text}");
+        assert!(text.contains("c1"));
+
+        // Small terminals stay safe in single-pane mode too.
+        render(&mut app, 12, 5);
+        render(&mut app, 8, 3);
+    }
+
+    #[test]
+    fn not_initialized_submodule_shows_hint() {
+        let (mut app, _t) = make_normal_app();
+        app.select_repo(2); // subC
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(text.contains("not initialized"));
+        assert!(
+            text.contains("git submodule update --init subC"),
+            "hint: {text}"
+        );
     }
 
     #[test]
@@ -512,7 +796,24 @@ mod tests {
         app.handle_mouse(click(rect.x + 2, rect.y));
 
         assert_eq!(app.repos.selected(), 2);
-        assert_eq!(app.focus, crate::app::Focus::Repos);
+        assert_eq!(app.focus, Focus::Repos);
+    }
+
+    #[test]
+    fn clicking_rendered_commit_row_selects_it() {
+        let (mut app, _t) = make_normal_app();
+        render(&mut app, 80, 24);
+
+        let (rect, _) = app
+            .hit_zones
+            .iter()
+            .find(|(_, h)| *h == Hit::CommitRow(1))
+            .copied()
+            .unwrap();
+        app.handle_mouse(click(rect.x + 2, rect.y));
+
+        assert_eq!(app.focus, Focus::Commits);
+        assert_eq!(app.entries[0].scroll.selected(), 1);
     }
 
     #[test]
@@ -523,6 +824,7 @@ mod tests {
         let text = screen_text(&buf);
 
         assert!(text.contains("move selection"));
+        assert!(text.contains("pick / un-pick"));
         assert!(text.contains("strictly local"));
 
         app.handle_mouse(click(40, 12));

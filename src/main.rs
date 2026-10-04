@@ -42,7 +42,7 @@ fn run_tui() -> ExitCode {
     // popup inside the TUI rather than a bare error on the console.
     let mut app = match discover(&cwd) {
         Ok(Some(repo)) => match overview(&repo) {
-            Ok(ov) => App::normal(ov),
+            Ok(ov) => App::normal(ov, repo),
             Err(e) => App::error(&cwd, format!("{e:#}")),
         },
         Ok(None) => App::not_repo(&cwd),
