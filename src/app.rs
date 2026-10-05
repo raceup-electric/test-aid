@@ -7,6 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::anyhow;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -67,6 +68,37 @@ pub struct BranchPopup {
     pub notice: Option<String>,
 }
 
+/// One planned change in the save flow: what the main repository should
+/// record for an entry after Save.
+#[derive(Debug, Clone)]
+pub struct SaveChange {
+    pub idx: usize,
+    pub name: String,
+    /// What the main repository records right now.
+    pub current: Option<git2::Oid>,
+    /// The picked commit.
+    pub pick: git2::Oid,
+    /// Title of the picked commit, for the confirmation list.
+    pub title: Option<String>,
+    /// Set when the target's working tree is dirty (checkout may be refused).
+    pub dirty_warning: Option<String>,
+}
+
+/// Outcome of applying saves: one message per success and (name, error)
+/// per failure. Failures never abort the remaining items.
+#[derive(Debug, Clone, Default)]
+pub struct ApplyOutcome {
+    pub applied: Vec<String>,
+    pub failed: Vec<(String, String)>,
+}
+
+/// The save popup (`s`): confirmation first, then the apply result.
+#[derive(Debug, Clone)]
+pub enum SaveStage {
+    Confirm(Vec<SaveChange>),
+    Result(ApplyOutcome),
+}
+
 /// A clickable region, registered by the renderer each frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
@@ -75,6 +107,10 @@ pub enum Hit {
     RepoRow(usize),
     CommitRow(usize),
     BranchRow(usize),
+    SavePopup,
+    SaveApply,
+    SaveCancel,
+    SaveOk,
     OkButton,
 }
 
@@ -251,6 +287,7 @@ pub struct App {
     pub repos: ScrollState,
     pub popup: Option<Popup>,
     pub branch_popup: Option<BranchPopup>,
+    pub save_popup: Option<SaveStage>,
     /// Clickable regions, refreshed by the renderer every frame.
     pub hit_zones: Vec<(Rect, Hit)>,
     pub pane_heights: PaneHeights,
@@ -283,6 +320,7 @@ impl App {
             repos: ScrollState::new(0),
             popup: None,
             branch_popup: None,
+            save_popup: None,
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
@@ -308,6 +346,7 @@ impl App {
             repos: ScrollState::new(1 + n),
             popup: None,
             branch_popup: None,
+            save_popup: None,
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
@@ -366,6 +405,7 @@ impl App {
         }
         match self.mode {
             Mode::NotRepo | Mode::Error => self.handle_message_key(key.code),
+            Mode::Normal if self.save_popup.is_some() => self.handle_save_key(key.code),
             Mode::Normal if self.branch_popup.is_some() => self.handle_branch_key(key.code),
             Mode::Normal if self.popup.is_some() => match key.code {
                 KeyCode::Esc
@@ -394,6 +434,7 @@ impl App {
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
             KeyCode::Char('r') | KeyCode::Char('R') => self.refresh(),
             KeyCode::Char('b') | KeyCode::Char('B') => self.open_branch_popup(),
+            KeyCode::Char('s') | KeyCode::Char('S') => self.open_save_popup(),
             KeyCode::Tab | KeyCode::BackTab if self.has_submodules() => {
                 self.focus = self.focus.toggle()
             }
@@ -420,7 +461,7 @@ impl App {
     }
 
     fn wheel(&mut self, dir: i32) {
-        if self.mode != Mode::Normal || self.popup.is_some() {
+        if self.mode != Mode::Normal || self.popup.is_some() || self.save_popup.is_some() {
             return;
         }
         if self.branch_popup.is_some() {
@@ -444,6 +485,23 @@ impl App {
     }
 
     fn handle_click(&mut self, col: u16, row: u16) {
+        // Save popup: buttons act, clicks inside the body are ignored,
+        // clicks outside close it (Cancel never applies anything).
+        if self.mode == Mode::Normal && self.save_popup.is_some() {
+            match self.hit_test(col, row) {
+                Some(Hit::SaveApply) => {
+                    if matches!(self.save_popup, Some(SaveStage::Confirm(_))) {
+                        self.apply_saves();
+                    } else {
+                        self.save_popup = None;
+                    }
+                }
+                Some(Hit::SaveCancel) | Some(Hit::SaveOk) => self.save_popup = None,
+                Some(Hit::SavePopup) => {}
+                _ => self.save_popup = None,
+            }
+            return;
+        }
         // Branch popup: clicking a row selects and switches; anything else
         // just closes it.
         if self.mode == Mode::Normal && self.branch_popup.is_some() {
@@ -613,6 +671,154 @@ impl App {
                     bp.notice = Some(format!("{e:#}"));
                 }
             }
+        }
+    }
+
+    // ---- save flow --------------------------------------------------------
+
+    fn handle_save_key(&mut self, code: KeyCode) {
+        let confirming = matches!(self.save_popup, Some(SaveStage::Confirm(_)));
+        match code {
+            KeyCode::Enter if confirming => self.apply_saves(),
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.save_popup = None,
+            KeyCode::Enter => self.save_popup = None, // result popup: close
+            _ => {}
+        }
+    }
+
+    /// `s`: open the confirmation popup with every pending pick. State is
+    /// refreshed first so warnings reflect the working trees as they are
+    /// right now, not as they were at startup.
+    fn open_save_popup(&mut self) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        self.refresh();
+        let changes = self.pending_saves();
+        self.save_popup = Some(SaveStage::Confirm(changes));
+    }
+
+    /// All picks that would change something, in entry order (main first).
+    fn pending_saves(&mut self) -> Vec<SaveChange> {
+        let mut changes = Vec::new();
+        for idx in 0..self.entries.len() {
+            let Some(pick) = self.entries[idx].pick else {
+                continue;
+            };
+            let current = self.current_oid(idx);
+            if current == Some(pick) {
+                continue;
+            }
+            self.ensure_sub_repo(idx);
+            let repo = if idx == 0 {
+                self.repo.as_ref()
+            } else {
+                self.sub_repos.get(idx - 1).and_then(|c| c.as_ref())
+            };
+            let title = repo
+                .and_then(|r| r.find_commit(pick).ok())
+                .and_then(|c| c.summary().map(str::to_string));
+            let name = self.entry_name(idx);
+            let dirty_warning = if idx == 0 {
+                self.overview
+                    .as_ref()
+                    .filter(|ov| ov.dirty)
+                    .map(|_| "worktree has changes — checkout may be refused".to_string())
+            } else {
+                self.overview
+                    .as_ref()
+                    .and_then(|ov| ov.submodules.get(idx - 1))
+                    .filter(|sm| sm.dirty == Some(true))
+                    .map(|_| "worktree is dirty — update may be refused".to_string())
+            };
+            changes.push(SaveChange {
+                idx,
+                name,
+                current,
+                pick,
+                title,
+                dirty_warning,
+            });
+        }
+        changes
+    }
+
+    /// Apply every pending pick, best-effort: main-repo checkout first (its
+    /// index rewrite must not clobber gitlinks staged afterwards), then each
+    /// submodule pointer. Failures are collected, never abort the run, and
+    /// keep their pick for a retry.
+    fn apply_saves(&mut self) {
+        // Fresh plan: state may have drifted since the popup opened.
+        let mut plan = Vec::new();
+        for idx in 0..self.entries.len() {
+            let Some(pick) = self.entries[idx].pick else {
+                continue;
+            };
+            let current = self.current_oid(idx);
+            if current == Some(pick) {
+                continue;
+            }
+            let path = if idx == 0 {
+                None
+            } else {
+                self.overview
+                    .as_ref()
+                    .and_then(|ov| ov.submodules.get(idx - 1))
+                    .map(|sm| sm.path.clone())
+            };
+            plan.push((idx, self.entry_name(idx), path, pick, current));
+        }
+
+        let mut outcome = ApplyOutcome::default();
+        let repo = self.repo.take();
+        for (idx, name, path, pick, current) in plan {
+            let result = if idx == 0 {
+                match repo.as_ref() {
+                    Some(r) => gitops::checkout_oid(r, pick),
+                    None => Err(anyhow!("repository unavailable")),
+                }
+            } else {
+                match (repo.as_ref(), path.as_deref()) {
+                    (Some(r), Some(p)) => gitops::set_submodule_pointer(r, p, pick),
+                    _ => Err(anyhow!("submodule path unavailable")),
+                }
+            };
+            match result {
+                Ok(()) => {
+                    outcome.applied.push(format!(
+                        "{name}: {} → {}",
+                        current.map(short_oid).unwrap_or_else(|| "—".into()),
+                        short_oid(pick)
+                    ));
+                    if let Some(entry) = self.entries.get_mut(idx) {
+                        entry.pick = None; // done; failed picks stay for retry
+                    }
+                }
+                Err(e) => outcome.failed.push((name, format!("{e:#}"))),
+            }
+        }
+        self.repo = repo;
+        self.save_popup = Some(SaveStage::Result(outcome));
+        self.refresh();
+    }
+
+    fn entry_name(&self, idx: usize) -> String {
+        if idx == 0 {
+            self.overview
+                .as_ref()
+                .map(|ov| {
+                    ov.root
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ov.root.display().to_string())
+                })
+                .unwrap_or_else(|| "main".to_string())
+        } else {
+            self.overview
+                .as_ref()
+                .and_then(|ov| ov.submodules.get(idx - 1))
+                .map(|sm| sm.name.clone())
+                .unwrap_or_else(|| format!("submodule {idx}"))
         }
     }
 
@@ -835,6 +1041,10 @@ impl App {
         }
         self.ensure_entry_loaded(self.repos.selected());
     }
+}
+
+fn short_oid(oid: git2::Oid) -> String {
+    oid.to_string()[..7].to_string()
 }
 
 #[cfg(test)]
@@ -1453,5 +1663,280 @@ mod tests {
         app.handle_key(key(KeyCode::Char('b')));
         app.handle_mouse(click(70, 2));
         assert!(app.branch_popup.is_none());
+    }
+
+    // ---- step 7: save flow ----------------------------------------------
+
+    /// Pick the older commit of subA (a1) via keys, leaving the app ready
+    /// to save.
+    fn pick_sub_a_older(app: &mut App) -> git2::Oid {
+        app.handle_key(key(KeyCode::Down)); // repos → subA
+        app.handle_key(key(KeyCode::Tab)); // commits
+        app.handle_key(key(KeyCode::Down)); // row 1 = a1
+        app.handle_key(key(KeyCode::Enter)); // pick
+        app.entries[1].pick.expect("pick set")
+    }
+
+    #[test]
+    fn save_confirm_lists_planned_change_with_details() {
+        let (mut app, temp) = normal_app();
+        let pick = pick_sub_a_older(&mut app);
+        let tip = app.overview.as_ref().unwrap().submodules[0]
+            .recorded_oid
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('s')));
+        match &app.save_popup {
+            Some(SaveStage::Confirm(changes)) => {
+                assert_eq!(changes.len(), 1);
+                let c = &changes[0];
+                assert_eq!(c.idx, 1);
+                assert_eq!(c.name, "subA");
+                assert_eq!(c.current, Some(tip));
+                assert_eq!(c.pick, pick);
+                assert_eq!(c.title.as_deref(), Some("a1"));
+                assert!(c.dirty_warning.is_none(), "clean subA gets no warning");
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+
+        // Dirtying subA adds a warning line.
+        fs::write(temp.path().join("super/subA/untracked.txt"), "x").unwrap();
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('s')));
+        match &app.save_popup {
+            Some(SaveStage::Confirm(changes)) => {
+                assert!(
+                    changes[0].dirty_warning.is_some(),
+                    "dirty subA gets a warning"
+                );
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn save_applies_submodule_pick_and_stages_pointer() {
+        let (mut app, temp) = normal_app();
+        let pick = pick_sub_a_older(&mut app);
+        let tip = app.overview.as_ref().unwrap().submodules[0]
+            .recorded_oid
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Enter)); // apply
+
+        // Result popup: one success, no failures; pick cleared.
+        match &app.save_popup {
+            Some(SaveStage::Result(outcome)) => {
+                assert_eq!(outcome.applied.len(), 1);
+                assert!(outcome.failed.is_empty());
+                assert!(outcome.applied[0].contains("subA"));
+                assert!(outcome.applied[0].contains('→'));
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(app.entries[1].pick, None, "applied pick is cleared");
+
+        // On disk: submodule workdir moved to the old commit (detached),
+        // superproject index staged it, HEAD tree still records the tip,
+        // and the submodule's own branch/commits are untouched.
+        let ov = app.overview.as_ref().unwrap();
+        let sm = &ov.submodules[0];
+        assert_eq!(sm.workdir_oid, Some(pick));
+        assert_eq!(sm.index_oid, Some(pick), "gitlink staged");
+        assert_eq!(sm.recorded_oid, Some(tip), "nothing was committed");
+        assert_eq!(
+            sm.head.as_ref().unwrap(),
+            &crate::gitx::HeadInfo::Detached(pick)
+        );
+        assert!(!temp.path().join("super/subA/file1.txt").exists());
+        let sub = crate::gitx::discover(&temp.path().join("super/subA"))
+            .unwrap()
+            .unwrap();
+        let sub_main = sub
+            .find_branch("main", git2::BranchType::Local)
+            .unwrap()
+            .get()
+            .target()
+            .unwrap();
+        assert_eq!(sub_main, tip, "newer commits still reachable on the branch");
+    }
+
+    #[test]
+    fn save_applies_main_repo_pick_as_detached_checkout() {
+        let (mut app, temp) = normal_app();
+        // Pick the root commit of the main repo.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down)); // row 1 = root
+        app.handle_key(key(KeyCode::Enter));
+        let pick = app.entries[0].pick.expect("pick set");
+
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Enter));
+
+        let ov = app.overview.as_ref().unwrap();
+        assert_eq!(ov.head, crate::gitx::HeadInfo::Detached(pick));
+        assert_eq!(ov.head_oid, Some(pick));
+        assert!(temp.path().join("super/README.md").exists());
+        assert!(
+            !temp.path().join("super/.gitmodules").exists(),
+            "workdir at root commit"
+        );
+        assert_eq!(app.entries[0].pick, None);
+    }
+
+    #[test]
+    fn save_failure_is_reported_and_pick_kept_for_retry() {
+        let (mut app, temp) = normal_app();
+        let root = temp.path().join("super");
+
+        // Conflict setup: subA moves to a3 (changing file0.txt), the file is
+        // then dirtied locally, and the pick targets a1 — a different commit
+        // whose file0.txt differs, so the checkout must be refused. (Picking
+        // the commit HEAD is already on is a legitimate no-op, not a failure.)
+        let a3 = {
+            let sub = crate::gitx::discover(&root.join("subA")).unwrap().unwrap();
+            fixture::commit_file(&sub, "file0.txt", "changed\n", "a3", BASE_TIME + 7200).unwrap()
+        };
+        fs::write(root.join("subA/file0.txt"), "dirty\n").unwrap();
+
+        app.handle_key(key(KeyCode::Down)); // subA
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down)); // row 1 = a2
+        app.handle_key(key(KeyCode::Down)); // row 2 = a1
+        app.handle_key(key(KeyCode::Enter)); // pick a1
+        let pick = app.entries[1].pick.expect("pick set");
+        assert_ne!(Some(pick), app.current_oid(1));
+
+        app.handle_key(key(KeyCode::Char('s')));
+        // The dirty state is flagged as a warning in the confirmation.
+        match &app.save_popup {
+            Some(SaveStage::Confirm(changes)) => {
+                assert!(changes[0].dirty_warning.is_some());
+            }
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+        app.handle_key(key(KeyCode::Enter)); // apply → refused
+
+        match &app.save_popup {
+            Some(SaveStage::Result(outcome)) => {
+                assert!(outcome.applied.is_empty());
+                assert_eq!(outcome.failed.len(), 1);
+                let (name, err) = &outcome.failed[0];
+                assert_eq!(name, "subA");
+                assert!(err.contains("would be overwritten"), "got: {err}");
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(app.entries[1].pick, Some(pick), "failed pick kept");
+        let ov = app.overview.as_ref().unwrap();
+        assert_eq!(
+            ov.submodules[0].workdir_oid,
+            Some(a3),
+            "submodule untouched: still at a3"
+        );
+        assert_eq!(
+            ov.submodules[0].index_oid, ov.submodules[0].recorded_oid,
+            "nothing staged"
+        );
+
+        // Restore the file to a1's content and retry: the pick now applies.
+        app.handle_key(key(KeyCode::Esc)); // close result
+        fs::write(root.join("subA/file0.txt"), "content of file0.txt\n").unwrap();
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Enter));
+        match &app.save_popup {
+            Some(SaveStage::Result(outcome)) => {
+                assert_eq!(outcome.applied.len(), 1);
+                assert!(outcome.failed.is_empty());
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(app.entries[1].pick, None);
+        let ov = app.overview.as_ref().unwrap();
+        assert_eq!(ov.submodules[0].index_oid, Some(pick), "staged after retry");
+        assert_eq!(ov.submodules[0].workdir_oid, Some(pick));
+    }
+
+    #[test]
+    fn esc_cancels_save_and_changes_nothing() {
+        let (mut app, _t) = normal_app();
+        let pick = pick_sub_a_older(&mut app);
+        let tip = app.overview.as_ref().unwrap().submodules[0]
+            .recorded_oid
+            .unwrap();
+
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Esc)); // cancel
+
+        assert!(app.save_popup.is_none());
+        assert_eq!(app.entries[1].pick, Some(pick), "pick still pending");
+        let ov = app.overview.as_ref().unwrap();
+        assert_eq!(ov.submodules[0].index_oid, Some(tip), "index untouched");
+        assert_eq!(ov.submodules[0].workdir_oid, Some(tip), "workdir untouched");
+    }
+
+    #[test]
+    fn save_with_no_picks_is_a_noop() {
+        let (mut app, _t) = normal_app();
+        app.handle_key(key(KeyCode::Char('s')));
+
+        match &app.save_popup {
+            Some(SaveStage::Confirm(changes)) => assert!(changes.is_empty()),
+            other => panic!("expected Confirm, got {other:?}"),
+        }
+        app.handle_key(key(KeyCode::Enter)); // apply empty plan
+        match &app.save_popup {
+            Some(SaveStage::Result(outcome)) => {
+                assert!(outcome.applied.is_empty());
+                assert!(outcome.failed.is_empty());
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        // Nothing changed on disk.
+        let ov = app.overview.as_ref().unwrap();
+        let sm = &ov.submodules[0];
+        assert_eq!(sm.index_oid, sm.recorded_oid);
+        assert_eq!(sm.workdir_oid, sm.recorded_oid);
+    }
+
+    #[test]
+    fn save_click_buttons_apply_and_cancel() {
+        let (mut app, _t) = normal_app();
+        let pick = pick_sub_a_older(&mut app);
+
+        // Cancel button: nothing happens.
+        app.handle_key(key(KeyCode::Char('s')));
+        app.hit_zones = vec![
+            (Rect::new(5, 5, 60, 10), Hit::SavePopup),
+            (Rect::new(10, 14, 9, 1), Hit::SaveApply),
+            (Rect::new(30, 14, 10, 1), Hit::SaveCancel),
+        ];
+        app.handle_mouse(click(35, 14)); // Cancel
+        assert!(app.save_popup.is_none());
+        assert_eq!(app.entries[1].pick, Some(pick));
+
+        // A click inside the popup body does nothing.
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_mouse(click(20, 8)); // SavePopup zone
+        assert!(app.save_popup.is_some(), "body clicks are ignored");
+
+        // Apply button: applies and shows the result.
+        app.handle_mouse(click(12, 14)); // Apply
+        match &app.save_popup {
+            Some(SaveStage::Result(outcome)) => assert_eq!(outcome.applied.len(), 1),
+            other => panic!("expected Result, got {other:?}"),
+        }
+        let ov = app.overview.as_ref().unwrap();
+        assert_eq!(ov.submodules[0].index_oid, Some(pick));
+
+        // OK button on the result popup closes it.
+        app.hit_zones = vec![
+            (Rect::new(5, 5, 60, 10), Hit::SavePopup),
+            (Rect::new(30, 14, 6, 1), Hit::SaveOk),
+        ];
+        app.handle_mouse(click(32, 14));
+        assert!(app.save_popup.is_none());
     }
 }

@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use crate::app::{self, App, Entry, Focus, Hit, Mode, Popup};
+use crate::app::{self, App, Entry, Focus, Hit, Mode, Popup, SaveStage};
 use crate::gitx::HeadInfo;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -128,6 +128,9 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
     if app.branch_popup.is_some() {
         draw_branch_popup(f, app);
     }
+    if app.save_popup.is_some() {
+        draw_save_popup(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -162,14 +165,16 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let text = if app.branch_popup.is_some() {
+    let text = if app.save_popup.is_some() {
+        " Enter apply · Esc cancel "
+    } else if app.branch_popup.is_some() {
         " ↑↓ select · Enter switch · Esc close "
     } else if app.popup.is_some() {
         " Esc — close "
     } else if app.has_submodules() {
-        " ↑↓/jk move · Tab/←→ panes · Enter pick · r refresh · ? help · q quit "
+        " ↑↓ move · Tab panes · Enter pick · b branch · s save · ? help · q quit "
     } else {
-        " ↑↓/jk move · Enter pick · r refresh · ? help · q quit "
+        " ↑↓ move · Enter pick · b branch · s save · ? help · q quit "
     };
     f.render_widget(Paragraph::new(text).dim(), area);
 }
@@ -606,6 +611,281 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
     );
 }
 
+/// The save popup (`s`): confirmation listing every planned change, then the
+/// apply result. Clicking Apply/OK/Cancel works; clicks inside the body are
+/// ignored so a stray click cannot cancel or apply anything.
+fn draw_save_popup(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    if area.width < 20 || area.height < 7 {
+        return;
+    }
+
+    // Owned view of the popup data, so hit zones can be registered after.
+    struct ChangeView {
+        name: String,
+        old: String,
+        new: String,
+        title: Option<String>,
+        warn: Option<String>,
+    }
+    enum View {
+        Confirm(Vec<ChangeView>),
+        Result {
+            applied: Vec<String>,
+            failed: Vec<(String, String)>,
+        },
+    }
+    let view = match &app.save_popup {
+        Some(SaveStage::Confirm(changes)) => View::Confirm(
+            changes
+                .iter()
+                .map(|c| ChangeView {
+                    name: c.name.clone(),
+                    old: c.current.map(short_oid).unwrap_or_else(|| "—".into()),
+                    new: short_oid(c.pick),
+                    title: c.title.clone(),
+                    warn: c.dirty_warning.clone(),
+                })
+                .collect(),
+        ),
+        Some(SaveStage::Result(outcome)) => View::Result {
+            applied: outcome.applied.clone(),
+            failed: outcome.failed.clone(),
+        },
+        None => return,
+    };
+
+    match &view {
+        View::Confirm(changes) => {
+            let n = changes.len();
+            let shown = n.min(8);
+            let extra = n - shown;
+            let warns: Vec<&str> = changes.iter().filter_map(|c| c.warn.as_deref()).collect();
+
+            let mut constraints: Vec<Constraint> = Vec::new();
+            constraints.extend(std::iter::repeat(Constraint::Length(1)).take(shown));
+            if extra > 0 {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.extend(std::iter::repeat(Constraint::Length(1)).take(warns.len()));
+            constraints.push(Constraint::Length(1)); // note
+            constraints.push(Constraint::Length(1)); // buttons
+
+            let title = if n == 1 {
+                " Save — apply 1 change? ".to_string()
+            } else {
+                format!(" Save — apply {n} changes? ")
+            };
+            let popup = centered_fixed(60, constraints.len() as u16 + 2, area);
+            f.render_widget(Clear, popup);
+            let block = Block::bordered()
+                .title(title)
+                .border_style(Style::new().fg(Color::Cyan));
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            app.hit_zones.push((popup, Hit::SavePopup));
+
+            let rows = Layout::vertical(constraints).split(inner);
+            let mut r = 0;
+            for c in changes.iter().take(shown) {
+                let mut spans = vec![
+                    Span::styled(c.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                    dim("  "),
+                    Span::styled(c.old.clone(), Style::new().fg(Color::Yellow)),
+                    dim(" → "),
+                    Span::styled(c.new.clone(), Style::new().fg(Color::Green)),
+                ];
+                if let Some(t) = &c.title {
+                    spans.push(dim(format!("  {t}")));
+                }
+                f.render_widget(Paragraph::new(Line::from(spans)), rows[r]);
+                r += 1;
+            }
+            if extra > 0 {
+                f.render_widget(Paragraph::new(format!("… and {extra} more")).dim(), rows[r]);
+                r += 1;
+            }
+            for w in warns {
+                f.render_widget(
+                    Paragraph::new(format!("⚠ {w}")).style(Style::new().fg(Color::Yellow)),
+                    rows[r],
+                );
+                r += 1;
+            }
+            f.render_widget(
+                Paragraph::new("nothing is committed or pushed — pointers are only staged").dim(),
+                rows[r],
+            );
+            r += 1;
+
+            if rows[r].height > 0 {
+                if n == 0 {
+                    f.render_widget(
+                        Paragraph::new("nothing picked yet — pick commits with Enter").dim(),
+                        rows[0],
+                    );
+                    draw_button(
+                        f,
+                        app,
+                        rows[r],
+                        "[ Cancel ]",
+                        Hit::SaveCancel,
+                        ButtonPos::Center,
+                    );
+                } else {
+                    draw_button(
+                        f,
+                        app,
+                        rows[r],
+                        "[ Apply ]",
+                        Hit::SaveApply,
+                        ButtonPos::Left,
+                    );
+                    draw_button(
+                        f,
+                        app,
+                        rows[r],
+                        "[ Cancel ]",
+                        Hit::SaveCancel,
+                        ButtonPos::Right,
+                    );
+                }
+            }
+        }
+        View::Result { applied, failed } => {
+            let shown_applied = applied.len().min(8);
+            let shown_failed = failed.len().min(3);
+            let empty = applied.is_empty() && failed.is_empty();
+            let mut lines = 0;
+            lines += shown_applied;
+            if applied.len() > shown_applied {
+                lines += 1;
+            }
+            lines += shown_failed * 3;
+            if failed.len() > shown_failed {
+                lines += 1;
+            }
+            if empty {
+                lines += 1;
+            }
+
+            let popup = centered_fixed(60, lines as u16 + 3, area);
+            f.render_widget(Clear, popup);
+            let block =
+                Block::bordered()
+                    .title(" Save result ")
+                    .border_style(if failed.is_empty() {
+                        Style::new().fg(Color::Green)
+                    } else {
+                        Style::new().fg(Color::Red)
+                    });
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            app.hit_zones.push((popup, Hit::SavePopup));
+
+            let mut constraints: Vec<Constraint> = std::iter::repeat(Constraint::Length(1))
+                .take(shown_applied)
+                .collect();
+            if applied.len() > shown_applied {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.extend(std::iter::repeat(Constraint::Length(3)).take(shown_failed));
+            if failed.len() > shown_failed {
+                constraints.push(Constraint::Length(1));
+            }
+            if empty {
+                constraints.push(Constraint::Length(1));
+            }
+            constraints.push(Constraint::Length(1)); // buttons
+            let rows = Layout::vertical(constraints).split(inner);
+
+            let mut r = 0;
+            for msg in applied.iter().take(shown_applied) {
+                f.render_widget(
+                    Paragraph::new(format!("✓ {msg}")).style(Style::new().fg(Color::Green)),
+                    rows[r],
+                );
+                r += 1;
+            }
+            if applied.len() > shown_applied {
+                f.render_widget(
+                    Paragraph::new(format!("… and {} more", applied.len() - shown_applied)).dim(),
+                    rows[r],
+                );
+                r += 1;
+            }
+            for (name, err) in failed.iter().take(shown_failed) {
+                f.render_widget(
+                    Paragraph::new(vec![
+                        Line::from(format!("✗ {name}")).style(Style::new().fg(Color::Red)),
+                        Line::from(format!("  {err}")).dim(),
+                    ])
+                    .wrap(Wrap { trim: false }),
+                    rows[r],
+                );
+                r += 1;
+            }
+            if failed.len() > shown_failed {
+                f.render_widget(
+                    Paragraph::new(format!("… and {} more", failed.len() - shown_failed)).dim(),
+                    rows[r],
+                );
+                r += 1;
+            }
+            if empty {
+                f.render_widget(Paragraph::new("nothing to apply").dim(), rows[r]);
+                r += 1;
+            }
+            if rows[r].height > 0 {
+                draw_button(f, app, rows[r], "[ OK ]", Hit::SaveOk, ButtonPos::Center);
+            }
+        }
+    }
+}
+
+/// Horizontal placement of a popup button inside its row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ButtonPos {
+    Left,
+    Center,
+    Right,
+}
+
+/// Render a button inside `row` and register its hit zone.
+fn draw_button(
+    f: &mut Frame,
+    app: &mut App,
+    row: Rect,
+    label: &str,
+    hit: Hit,
+    pos: ButtonPos,
+) -> Rect {
+    let w = (label.len() as u16).min(row.width);
+    if w == 0 || row.height == 0 {
+        return Rect::new(row.x, row.y, 0, 0);
+    }
+    let x = match pos {
+        ButtonPos::Center => row.x + (row.width - w) / 2,
+        ButtonPos::Left => (row.x + row.width / 2)
+            .saturating_sub(w)
+            .saturating_sub(2)
+            .max(row.x),
+        ButtonPos::Right => (row.x + row.width / 2 + 2).min(row.x + row.width - w),
+    };
+    let rect = Rect::new(x, row.y, w, 1);
+    f.render_widget(
+        Paragraph::new(label).style(
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        rect,
+    );
+    app.hit_zones.push((rect, hit));
+    rect
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     let popup = centered_rect(70, 90, area);
     f.render_widget(Clear, popup);
@@ -619,11 +899,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("↑ ↓ / k j", "move selection"),
         ("PgUp PgDn / Home End", "scroll by page / first-last"),
         ("Tab / Shift+Tab", "switch pane (repos ↔ commits)"),
-        (
-            "Enter",
-            "pick / un-pick the commit the main repository records",
-        ),
-        ("b", "switch branch of the selected repo / submodule"),
+        ("Enter", "pick / un-pick recorded commit"),
+        ("b", "switch branch of repo/submodule"),
+        ("s", "save: apply picked commits"),
         ("r", "refresh repository state"),
         ("click / wheel", "select rows, focus panes, scroll"),
         ("?", "toggle this help"),
@@ -644,9 +922,9 @@ fn draw_help(f: &mut Frame, area: Rect) {
     lines.push(Line::from("  ● recorded / current commit"));
     lines.push(Line::from("  ○ where the submodule's working directory is"));
     lines.push(Line::from("  ✓ your pick"));
-    lines.push(
-        Line::from("  taid is strictly local: nothing is fetched, pushed or committed.").dim(),
-    );
+    lines.push(Line::from(
+        "  taid is strictly local: nothing is fetched or pushed.".dim(),
+    ));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -727,7 +1005,7 @@ fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, Focus, Hit, Popup};
+    use crate::app::{App, ApplyOutcome, Focus, Hit, Popup, SaveChange, SaveStage};
     use crate::fixture::{self, SubSpec, TempDir};
     use crate::gitx;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -1045,6 +1323,95 @@ mod tests {
     }
 
     #[test]
+    fn save_confirm_renders_changes_warning_and_buttons() {
+        let (mut app, temp) = make_normal_app();
+        // Pick subA's older commit, then dirty subA to get a warning.
+        app.select_repo(1);
+        app.focus = Focus::Commits;
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        std::fs::write(temp.path().join("super/subA/untracked.txt"), "x").unwrap();
+        app.handle_key(key(KeyCode::Char('s')));
+
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(text.contains("Save — apply 1 change?"), "title: {text}");
+        assert!(text.contains("subA"));
+        assert!(text.contains('→'), "old → new: {text}");
+        assert!(text.contains("a1"), "picked title: {text}");
+        assert!(text.contains('⚠'), "dirty warning: {text}");
+        assert!(text.contains("[ Apply ]"));
+        assert!(text.contains("[ Cancel ]"));
+        assert!(text.contains("nothing is committed or pushed"));
+
+        // Both buttons registered as hit zones.
+        assert!(app.hit_zones.iter().any(|(_, h)| *h == Hit::SaveApply));
+        assert!(app.hit_zones.iter().any(|(_, h)| *h == Hit::SaveCancel));
+    }
+
+    #[test]
+    fn clicking_apply_button_applies_and_shows_result() {
+        let (mut app, _t) = make_normal_app();
+        app.select_repo(1);
+        app.focus = Focus::Commits;
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let pick = app.entries[1].pick.unwrap();
+        app.handle_key(key(KeyCode::Char('s')));
+        render(&mut app, 80, 24);
+
+        let (rect, _) = app
+            .hit_zones
+            .iter()
+            .find(|(_, h)| *h == Hit::SaveApply)
+            .copied()
+            .unwrap();
+        app.handle_mouse(click(rect.x + 2, rect.y));
+
+        match &app.save_popup {
+            Some(SaveStage::Result(outcome)) => {
+                assert_eq!(outcome.applied.len(), 1);
+            }
+            other => panic!("expected Result, got {other:?}"),
+        }
+        assert_eq!(
+            app.overview.as_ref().unwrap().submodules[0].index_oid,
+            Some(pick),
+            "pointer staged"
+        );
+
+        // Result renders ✓ and an OK button; clicking OK closes.
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(text.contains("Save result"));
+        assert!(text.contains('✓'));
+        assert!(text.contains("[ OK ]"));
+        let (ok, _) = app
+            .hit_zones
+            .iter()
+            .find(|(_, h)| *h == Hit::SaveOk)
+            .copied()
+            .unwrap();
+        app.handle_mouse(click(ok.x + 2, ok.y));
+        assert!(app.save_popup.is_none());
+    }
+
+    #[test]
+    fn save_result_renders_failure_with_error() {
+        let (mut app, _t) = make_normal_app();
+        app.save_popup = Some(SaveStage::Result(ApplyOutcome {
+            applied: vec!["subA: 1111111 → 2222222".to_string()],
+            failed: vec![("subC".to_string(), "cannot update: dirty".to_string())],
+        }));
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(text.contains('✓'));
+        assert!(text.contains('✗'));
+        assert!(text.contains("subC"));
+        assert!(text.contains("cannot update: dirty"));
+    }
+
+    #[test]
     fn small_terminal_does_not_panic() {
         let (mut app, _t) = make_normal_app();
         for (w, h) in [(0, 0), (1, 1), (2, 2), (10, 4), (20, 6), (80, 24)] {
@@ -1059,6 +1426,26 @@ mod tests {
         bapp.handle_key(key(KeyCode::Char('b')));
         for (w, h) in [(0, 0), (2, 2), (10, 4), (20, 6), (80, 24)] {
             render(&mut bapp, w, h);
+        }
+        // So must the save popups (confirm and result).
+        let (mut sapp, _t) = make_branchy_app();
+        sapp.save_popup = Some(SaveStage::Confirm(vec![SaveChange {
+            idx: 1,
+            name: "subA".to_string(),
+            current: None,
+            pick: git2::Oid::zero(),
+            title: Some("t".to_string()),
+            dirty_warning: Some("w".to_string()),
+        }]));
+        for (w, h) in [(0, 0), (2, 2), (10, 4), (19, 6), (80, 24)] {
+            render(&mut sapp, w, h);
+        }
+        sapp.save_popup = Some(SaveStage::Result(ApplyOutcome {
+            applied: vec!["a: 1 → 2".to_string()],
+            failed: vec![("b".to_string(), "err".to_string())],
+        }));
+        for (w, h) in [(0, 0), (2, 2), (10, 4), (19, 6), (80, 24)] {
+            render(&mut sapp, w, h);
         }
     }
 }

@@ -269,6 +269,83 @@ fn branch_switch_flow_end_to_end() -> TestResult {
 }
 
 #[test]
+fn save_flow_end_to_end() -> TestResult {
+    let (_temp, root) = super_repo("pty-save")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // j → subA, Tab → commits, j → older commit, Enter → pick,
+    // s → confirm, Enter → apply, q → close result, q → quit.
+    session.send("j\tj\rs\rqq")?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit on its own");
+    assert!(status.success(), "raw output: {raw:?}");
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(
+        screen.contains("Save — apply 1 change?"),
+        "confirm: {screen:?}"
+    );
+    assert!(screen.contains("Save result"), "result: {screen:?}");
+    assert!(screen.contains('✓'), "success line: {screen:?}");
+
+    // On-disk verification (the user's acceptance criteria):
+    let super_repo = taid::gitx::discover(&root)?.expect("super repo");
+    let ov = taid::gitx::overview(&super_repo)?;
+    let sm = &ov.submodules[0];
+    let sub = taid::gitx::discover(&root.join("subA"))?.expect("sub repo");
+    // The branch still points at the newest commit; HEAD moved to its parent.
+    let sub_main = sub
+        .find_branch("main", git2::BranchType::Local)?
+        .get()
+        .target()
+        .expect("sub main branch");
+    let a2 = sub.find_commit(sub_main)?;
+    let a1 = a2.parent(0)?;
+    assert_eq!(
+        sub_main,
+        a2.id(),
+        "newer commits still reachable in the submodule"
+    );
+    assert_eq!(sm.recorded_oid, Some(a2.id()), "HEAD tree unchanged");
+    assert_eq!(
+        sm.index_oid,
+        Some(a1.id()),
+        "pointer staged at the older commit"
+    );
+    assert_eq!(
+        sub.head()?.target(),
+        Some(a1.id()),
+        "submodule workdir at a1"
+    );
+    Ok(())
+}
+
+#[test]
+fn quitting_without_save_changes_nothing() -> TestResult {
+    let (_temp, root) = super_repo("pty-nosave")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Pick a commit but quit without saving.
+    session.send("j\tj\rq")?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit on its own");
+    assert!(status.success(), "raw output: {raw:?}");
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(screen.contains('✓'), "pick was visible: {screen:?}");
+
+    let super_repo = taid::gitx::discover(&root)?.expect("super repo");
+    let ov = taid::gitx::overview(&super_repo)?;
+    let sm = &ov.submodules[0];
+    let sub = taid::gitx::discover(&root.join("subA"))?.expect("sub repo");
+    let a2 = sub.head()?.peel_to_commit()?;
+    assert_eq!(sm.recorded_oid, Some(a2.id()));
+    assert_eq!(sm.index_oid, Some(a2.id()), "index untouched without save");
+    assert_eq!(sub.head()?.target(), Some(a2.id()), "workdir untouched");
+    Ok(())
+}
+
+#[test]
 fn panic_restores_the_terminal_before_printing() -> TestResult {
     if !cfg!(debug_assertions) {
         // The TAID_PANIC_TEST hook only exists in debug builds.

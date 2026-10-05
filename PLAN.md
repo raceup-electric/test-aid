@@ -185,19 +185,28 @@ markers and layout correct. ✅ (50 unit + 4 pty tests)
       at different trees
 **Done when:** branch switch verified on main repo and submodule fixtures; UI refreshes. ✅ (61 unit + 5 pty tests)
 
-### Step 7 — Save flow
-- [ ] Pending-picks model (per repo: chosen OID vs recorded)
-- [ ] `s` → confirmation popup: planned changes as `repo: <old sha> → <new sha> — <title>`,
-      plus warnings for dirty working trees
-- [ ] `Enter` applies best-effort per item, collecting per-item errors; result popup
-      shows successes/failures; `Esc` cancels (nothing done)
-- [ ] After apply: refresh all state from disk
-- [ ] `dev/fixtures.sh`: script that builds a test superproject with 2 submodules and
-      multi-commit histories for manual end-to-end testing
+### Step 7 — Save flow ✅
+- [x] Pending-picks model (per repo: chosen OID vs recorded) — landed in step 5;
+      Save consumes it
+- [x] `s` → confirmation popup: `name old → new — title` per change, ⚠ warnings
+      for dirty working trees (state is refreshed when the popup opens so
+      warnings reflect the trees right now), `[ Apply ]` / `[ Cancel ]` buttons
+      (clicks inside the popup body are ignored — no accidental apply/cancel)
+- [x] `Enter` applies best-effort per item — main-repo checkout first (its index
+      rewrite must not clobber gitlinks staged afterwards), then each submodule
+      pointer; result popup shows ✓ per success and ✗ + error per failure;
+      `Esc`/`q`/click-outside cancels (nothing done); failed picks stay for retry
+- [x] After apply: refresh all state from disk (successful picks clear)
+- [x] `dev/fixtures.sh`: builds a demo superproject — subA clean (+`old` branch),
+      subB drifted, subC uninitialized, `experiment` branch on the main repo
+      (verified with `git submodule status`: ` `, `+`, `-` markers)
 **Done when (manual E2E):** pick an old commit on a submodule, Save → superproject
 shows the staged pointer change and the submodule workdir is at the old commit, while
 `git log` in the submodule still lists the newer commits; quitting without Save leaves
-everything untouched.
+everything untouched. ✅ Both verified end-to-end by pty tests against the real binary
+(`save_flow_end_to_end`, `quitting_without_save_changes_nothing`) + 8 new unit/ui tests.
+Test-found behaviors: picking the commit a repo is already on is a legitimate no-op
+checkout (not a conflict); fixture commits must be timestamped to sort as intended.
 
 ### Step 8 — Polish & hardening
 - [ ] Mouse: click rows to select/focus, click buttons
