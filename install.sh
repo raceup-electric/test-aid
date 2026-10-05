@@ -52,6 +52,7 @@ if [ -n "$local_bin" ]; then
     source_bin=$local_bin
 else
     release_repo=${TAID_REPO:-raceup-electric/test-aid}
+    auth_token=${GH_TOKEN:-}
     case $release_repo in
         */*) ;;
         *) fail 'TAID_REPO must be owner/name' ;;
@@ -60,7 +61,19 @@ else
     if [ "$tag" = latest ]; then release_path=latest/download
     else release_path="download/$tag"; fi
     archive="taid-$tag-$target$ext"
-    if [ "$tag" = latest ]; then
+    if [ -n "$auth_token" ] && [ "$dry_run" = false ]; then
+        command -v jq >/dev/null 2>&1 || fail 'jq is required for private release downloads'
+        command -v curl >/dev/null 2>&1 || fail 'curl is required for private release downloads'
+        if [ "$tag" = latest ]; then release_api="https://api.github.com/repos/$release_repo/releases/latest"
+        else release_api="https://api.github.com/repos/$release_repo/releases/tags/$tag"; fi
+        release_json=$(curl -fsSL -H "Authorization: Bearer $auth_token" -H 'Accept: application/vnd.github+json' "$release_api") || fail 'could not read release metadata'
+        tag=$(printf '%s' "$release_json" | jq -r '.tag_name // empty')
+        case $tag in *[!A-Za-z0-9._-]*|'') fail 'invalid tag in release metadata' ;; esac
+        archive="taid-$tag-$target$ext"
+        archive_url=$(printf '%s' "$release_json" | jq -r --arg name "$archive" '[.assets[] | select(.name == $name) | .url] | if length == 1 then .[0] else empty end')
+        sums_url=$(printf '%s' "$release_json" | jq -r '[.assets[] | select(.name == "SHA256SUMS.txt") | .url] | if length == 1 then .[0] else empty end')
+        [ -n "$archive_url" ] && [ -n "$sums_url" ] || fail 'release archive or checksums not found'
+    elif [ "$tag" = latest ]; then
         # GitHub's latest/download endpoint needs the real tag in the asset name.
         # Resolve it from the redirect without downloading an archive.
         if [ "$dry_run" = false ]; then
@@ -77,9 +90,11 @@ else
             archive="taid-<latest-tag>-$target$ext"
         fi
     fi
-    base_url="https://github.com/$release_repo/releases/$release_path"
-    archive_url="$base_url/$archive"
-    sums_url="$base_url/SHA256SUMS.txt"
+    if [ -z "$auth_token" ] || [ "$dry_run" = true ]; then
+        base_url="https://github.com/$release_repo/releases/$release_path"
+        archive_url="$base_url/$archive"
+        sums_url="$base_url/SHA256SUMS.txt"
+    fi
 fi
 
 case ${SHELL##*/} in
@@ -91,7 +106,10 @@ esac
 if [ "$dry_run" = true ]; then
     printf 'Platform: %s (%s %s)\n' "$target" "$os" "$arch"
     if [ -n "$local_bin" ]; then printf 'Binary: %s\n' "$local_bin"
-    else printf 'Archive: %s\nChecksums: %s\n' "$archive_url" "$sums_url"; fi
+    else
+        printf 'Archive: %s\nChecksums: %s\n' "$archive_url" "$sums_url"
+        [ -z "${auth_token:-}" ] || printf 'Authentication: GH_TOKEN via GitHub API\n'
+    fi
     printf 'Install: %s\nPATH rc: %s (only if needed)\n' "$install_dir/$binary" "$rc"
     exit 0
 fi
@@ -103,8 +121,10 @@ trap 'rm -rf "$tmp_dir"; [ -z "$stage_bin" ] || rm -f "$stage_bin"' EXIT HUP INT
 if [ -z "$local_bin" ]; then
     download() {
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL --retry 3 -o "$2" "$1"
-        elif command -v wget >/dev/null 2>&1; then
+            if [ -n "${auth_token:-}" ]; then
+                curl -fsSL --retry 3 -H "Authorization: Bearer $auth_token" -H 'Accept: application/octet-stream' -o "$2" "$1"
+            else curl -fsSL --retry 3 -o "$2" "$1"; fi
+        elif command -v wget >/dev/null 2>&1 && [ -z "${auth_token:-}" ]; then
             wget -q -O "$2" "$1"
         else fail 'curl or wget is required for release downloads'; fi
     }

@@ -20,6 +20,10 @@ v0.1.0` for a specific version. Release downloads are checked against
 `SHA256SUMS.txt`. Set `TAID_REPO=owner/name` to use a different release
 repository. `--dry-run` prints the target and URLs without changing files.
 The default release repository is `raceup-electric/test-aid`.
+For a private release, set `GH_TOKEN` in your environment to a GitHub token
+with repository Contents read access before running the installer. Private
+downloads require `curl` and `jq`; the token is used only for the download and
+is not saved by the installer. Public releases need no token.
 
 Alternatively, install from source with Cargo:
 
