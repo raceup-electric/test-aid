@@ -1,0 +1,16 @@
+name: Release build - Linux ARM64
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  status:
+    uses: ./.github/workflows/release-target-status.yml
+    with:
+      target: aarch64-unknown-linux-musl

@@ -1,0 +1,16 @@
+name: Release build - Linux ARMv7
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  status:
+    uses: ./.github/workflows/release-target-status.yml
+    with:
+      target: armv7-unknown-linux-musleabihf

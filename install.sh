@@ -53,6 +53,9 @@ if [ -n "$local_bin" ]; then
 else
     release_repo=${TAID_REPO:-raceup-electric/test-aid}
     auth_token=${GH_TOKEN:-}
+    if [ -z "$auth_token" ] && command -v gh >/dev/null 2>&1; then
+        auth_token=$(gh auth token --hostname github.com 2>/dev/null || true)
+    fi
     case $release_repo in
         */*) ;;
         *) fail 'TAID_REPO must be owner/name' ;;
@@ -78,9 +81,9 @@ else
         # Resolve it from the redirect without downloading an archive.
         if [ "$dry_run" = false ]; then
             if command -v curl >/dev/null 2>&1; then
-                final_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$release_repo/releases/latest") || fail 'could not resolve latest release'
+                final_url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$release_repo/releases/latest") || fail 'could not resolve latest release (for a private repo, authenticate gh or set GH_TOKEN)'
             elif command -v wget >/dev/null 2>&1; then
-                final_url=$(wget --spider -S "https://github.com/$release_repo/releases/latest" 2>&1 | sed -n 's/.*Location: //p' | tail -n 1) || fail 'could not resolve latest release'
+                final_url=$(wget --spider -S "https://github.com/$release_repo/releases/latest" 2>&1 | sed -n 's/.*Location: //p' | tail -n 1) || fail 'could not resolve latest release (for a private repo, authenticate gh or set GH_TOKEN)'
             else fail 'curl or wget is required for release downloads'; fi
             tag=${final_url##*/}
             case $tag in v[0-9]*|[0-9]*) ;; *) fail 'could not determine latest release tag' ;; esac

@@ -6,26 +6,62 @@ It never fetches, pushes, creates commits, or rewrites history.
 
 ## Install
 
-Install an existing local build without network access:
+From a checkout of this repository, install the latest release for your machine:
+
+```sh
+./install.sh
+```
+
+The installer detects the OS and CPU architecture, selects the matching binary,
+checks it against `SHA256SUMS.txt`, and installs it to `~/.local/bin`. It adds
+that directory to your shell's PATH if needed; open a new shell afterwards.
+Run `./install.sh --dry-run` to see the selected target without installing.
+
+This repository is currently **private**, so first authenticate with GitHub CLI
+(`gh auth login`) or supply a token with repository **Contents: read** access:
+
+```sh
+GH_TOKEN=your_token ./install.sh
+```
+
+With an authenticated `gh` CLI, the first `./install.sh` command works as-is;
+the installer uses its token automatically. Private downloads require `curl`
+and `jq`. SSH access to the repository alone does not authenticate release
+downloads. The token is used only for the download and is not saved by the
+installer. Public releases need no token.
+
+Use `./install.sh --tag v0.1.0` to pin a version,
+`TAID_INSTALL_DIR=/absolute/path ./install.sh` to choose the destination, or
+`TAID_REPO=owner/name ./install.sh` to use a different release repository.
+To install an existing local build
+without network access:
 
 ```sh
 cargo build --locked
 ./install.sh --bin target/debug/taid
 ```
 
-This installs to `~/.local/bin` and adds it to your shell's PATH if needed.
-Set `TAID_INSTALL_DIR` to another absolute directory. To install a published
-release, run `./install.sh` for the latest version or `./install.sh --tag
-v0.1.0` for a specific version. Release downloads are checked against
-`SHA256SUMS.txt`. Set `TAID_REPO=owner/name` to use a different release
-repository. `--dry-run` prints the target and URLs without changing files.
-The default release repository is `raceup-electric/test-aid`.
-The published [v0.1.0 release](https://github.com/raceup-electric/test-aid/releases/tag/v0.1.0)
-includes binaries for Linux, macOS, and Windows.
-For a private release, set `GH_TOKEN` in your environment to a GitHub token
-with repository Contents read access before running the installer. Private
-downloads require `curl` and `jq`; the token is used only for the download and
-is not saved by the installer. Public releases need no token.
+### Release builds
+
+The [latest release](https://github.com/raceup-electric/test-aid/releases/latest)
+contains one archive for each supported OS and architecture. These badges
+track the **individual target jobs** in the latest tagged release build, not
+just the overall release workflow. They update after each release build;
+[![CI](https://github.com/raceup-electric/test-aid/actions/workflows/ci.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/ci.yml)
+tracks format, lint, and tests on `main` separately.
+
+| OS | Architecture | Release target | Build |
+| --- | --- | --- | --- |
+| Linux | x86-64 | `x86_64-unknown-linux-musl` | [![Linux x86-64 build](https://github.com/raceup-electric/test-aid/actions/workflows/release-linux-x86_64.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-linux-x86_64.yml) |
+| Linux | ARM64 | `aarch64-unknown-linux-musl` | [![Linux ARM64 build](https://github.com/raceup-electric/test-aid/actions/workflows/release-linux-aarch64.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-linux-aarch64.yml) |
+| Linux | ARMv7 | `armv7-unknown-linux-musleabihf` | [![Linux ARMv7 build](https://github.com/raceup-electric/test-aid/actions/workflows/release-linux-armv7.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-linux-armv7.yml) |
+| macOS | Intel | `x86_64-apple-darwin` | [![macOS Intel build](https://github.com/raceup-electric/test-aid/actions/workflows/release-macos-x86_64.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-macos-x86_64.yml) |
+| macOS | Apple silicon | `aarch64-apple-darwin` | [![macOS Apple silicon build](https://github.com/raceup-electric/test-aid/actions/workflows/release-macos-aarch64.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-macos-aarch64.yml) |
+| Windows | x86-64 | `x86_64-pc-windows-msvc` | [![Windows x86-64 build](https://github.com/raceup-electric/test-aid/actions/workflows/release-windows-x86_64.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-windows-x86_64.yml) |
+| Windows | ARM64 | `aarch64-pc-windows-msvc` | [![Windows ARM64 build](https://github.com/raceup-electric/test-aid/actions/workflows/release-windows-aarch64.yml/badge.svg)](https://github.com/raceup-electric/test-aid/actions/workflows/release-windows-aarch64.yml) |
+
+Because the repository is private, GitHub's workflow badges are visible to
+people with access to it, but cannot be embedded on external sites.
 
 Alternatively, install from source with Cargo:
 

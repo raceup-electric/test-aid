@@ -1,0 +1,16 @@
+name: Release build - macOS Intel
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  actions: read
+  contents: read
+jobs:
+  status:
+    uses: ./.github/workflows/release-target-status.yml
+    with:
+      target: x86_64-apple-darwin
