@@ -1,0 +1,136 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+            zig: true
+            archive: tar.gz
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-latest
+            zig: true
+            archive: tar.gz
+          - target: armv7-unknown-linux-musleabihf
+            runner: ubuntu-latest
+            zig: true
+            archive: tar.gz
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            zig: false
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-15
+            zig: false
+            archive: tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            zig: false
+            archive: zip
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
+            zig: false
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@v2
+        if: matrix.zig
+        with:
+          version: 0.13.0
+      - uses: taiki-e/install-action@cargo-zigbuild
+        if: matrix.zig
+      - name: Build static Linux binary
+        if: matrix.zig
+        env:
+          LIBZ_SYS_STATIC: '1'
+        run: cargo zigbuild --release --locked --target ${{ matrix.target }}
+      - name: Build native binary
+        if: ${{ !matrix.zig }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist/package
+          cp "target/$TARGET/release/taid" README.md LICENSE dist/package/
+          chmod 755 dist/package/taid
+          tar -czf "dist/taid-$TAG-$TARGET.tar.gz" -C dist/package taid README.md LICENSE
+          if [[ "$TARGET" == *linux-musl* ]]; then
+            file "target/$TARGET/release/taid" | grep -q 'statically linked'
+          fi
+          if [ "$TARGET" = x86_64-unknown-linux-musl ]; then
+            "target/$TARGET/release/taid" --version
+          fi
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          New-Item -ItemType Directory -Force dist/package | Out-Null
+          Copy-Item "target/$env:TARGET/release/taid.exe" dist/package/
+          Copy-Item README.md dist/package/
+          Copy-Item LICENSE dist/package/
+          & "target/$env:TARGET/release/taid.exe" --version
+          Compress-Archive -Path dist/package/taid.exe,dist/package/README.md,dist/package/LICENSE -DestinationPath "dist/taid-$env:TAG-$env:TARGET.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/taid-*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and checksum all seven archives
+        shell: bash
+        run: |
+          test "$(find dist -maxdepth 1 -type f -name 'taid-*' | wc -l)" -eq 7
+          cd dist
+          sha256sum taid-*.tar.gz taid-*.zip > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/taid-*.tar.gz
+            dist/taid-*.zip
+            dist/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true
