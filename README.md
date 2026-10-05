@@ -6,7 +6,22 @@ It never fetches, pushes, creates commits, or rewrites history.
 
 ## Install
 
-Until release binaries and `install.sh` are available, install from this checkout:
+Install an existing local build without network access:
+
+```sh
+cargo build --locked
+./install.sh --bin target/debug/taid
+```
+
+This installs to `~/.local/bin` and adds it to your shell's PATH if needed.
+Set `TAID_INSTALL_DIR` to another absolute directory. To install a published
+release, run `./install.sh` for the latest version or `./install.sh --tag
+v0.1.0` for a specific version. Release downloads are checked against
+`SHA256SUMS.txt`. Set `TAID_REPO=owner/name` to use a different release
+repository. `--dry-run` prints the target and URLs without changing files.
+Release binaries become available with step 10 of the plan.
+
+Alternatively, install from source with Cargo:
 
 ```sh
 cargo install --path . --locked
@@ -64,6 +79,7 @@ one with `git submodule update --init <path>` outside taid.
 | `Tab` / `Shift+Tab` | Switch between repository and commit panes |
 | `Enter` | Pick or unpick a commit; confirm a popup action |
 | `b` | Open the local branch switcher |
+| `/` | Filter commits by title or SHA (type to filter, `Enter` to keep, `Esc` to clear) |
 | `s` | Review and apply pending picks |
 | `r` | Refresh repository state |
 | `?` | Open help |

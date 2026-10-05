@@ -187,10 +187,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         " ↑↓ select · Enter switch · Esc close "
     } else if app.popup.is_some() {
         " Esc — close "
+    } else if app.filter_editing {
+        let prompt = format!(" /{}▌  Enter keep · Esc clear · Ctrl+U clear ", app.filter);
+        f.render_widget(
+            Paragraph::new(ellipsize(&prompt, area.width as usize)).fg(ACCENT),
+            area,
+        );
+        return;
     } else if app.has_submodules() {
-        " ↑↓ move · Tab panes · Enter pick · b branch · s save · ? help · q quit "
+        " ↑↓ move · Tab panes · Enter pick · / filter · b branch · s save · ? help · q quit "
     } else {
-        " ↑↓ move · Enter pick · b branch · s save · ? help · q quit "
+        " ↑↓ move · Enter pick · / filter · b branch · s save · ? help · q quit "
     };
     f.render_widget(Paragraph::new(text).dim(), area);
 }
@@ -328,7 +335,11 @@ fn draw_commits_pane(f: &mut Frame, app: &mut App, area: Rect) {
             (offset..offset + count)
                 .map(|i| {
                     let is_selected = entry.scroll.selected() == i;
-                    match entry.log.get(i) {
+                    match entry
+                        .visible
+                        .get(i)
+                        .and_then(|&original| entry.log.get(original))
+                    {
                         Some(c) => {
                             let (marker, color) = if entry.pick == Some(c.oid) {
                                 ('✓', PICKED)
@@ -395,21 +406,41 @@ fn list_meta(app: &App, idx: usize) -> (String, Option<String>) {
         return (String::new(), None);
     };
     let total = app.entries.get(idx).map(|e| e.log.len()).unwrap_or(0);
+    let shown = app.entries.get(idx).map(|e| e.visible.len()).unwrap_or(0);
+    let count = if app.filter.is_empty() {
+        format!("{total}")
+    } else {
+        format!("{shown}/{total} matching /{}", app.filter)
+    };
     match app::entry_at(ov, idx) {
         Some(Entry::Main(m)) => (
-            format!(" History — {} ({total}) ", root_name(&m.root)),
-            (total == 0).then(|| "no commits yet".to_string()),
+            format!(" History — {} ({count}) ", root_name(&m.root)),
+            (shown == 0).then(|| {
+                if total == 0 {
+                    "no commits yet"
+                } else {
+                    "no matching commits"
+                }
+                .to_string()
+            }),
         ),
         Some(Entry::Sub(sm)) if !sm.initialized => (
-            format!(" History — {} ({total}) ", sm.name),
+            format!(" History — {} ({count}) ", sm.name),
             Some(format!(
                 "submodule not initialized — nothing to browse\nrun: git submodule update --init {}",
                 sm.path
             )),
         ),
         Some(Entry::Sub(sm)) => (
-            format!(" History — {} ({total}) ", sm.name),
-            (total == 0).then(|| "no commits yet".to_string()),
+            format!(" History — {} ({count}) ", sm.name),
+            (shown == 0).then(|| {
+                if total == 0 {
+                    "no commits yet"
+                } else {
+                    "no matching commits"
+                }
+                .to_string()
+            }),
         ),
         None => (String::new(), None),
     }
@@ -942,6 +973,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("b", "switch branch of repo/submodule"),
         ("s", "save: apply picked commits"),
         ("r", "refresh repository state"),
+        ("/", "filter commits by title or SHA"),
         ("click / wheel", "select rows, focus panes, scroll"),
         ("?", "toggle this help"),
         ("q / Esc", "quit (or close a popup)"),
@@ -956,7 +988,6 @@ fn draw_help(f: &mut Frame, area: Rect) {
             Span::raw(*d),
         ]));
     }
-    lines.push(Line::from(""));
     lines.push(Line::from("Markers"));
     lines.push(Line::from("  ● recorded / current commit"));
     lines.push(Line::from("  ○ where the submodule's working directory is"));

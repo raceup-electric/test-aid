@@ -214,24 +214,29 @@ checkout (not a conflict); fixture commits must be timestamped to sort as intend
       and OK)
 - [x] Truncate long titles/paths by terminal-cell width with an ellipsis,
       preserving Unicode grapheme clusters; consistent color scheme
-- [ ] Optional: `/` filter in the commit list (deferred)
+- [x] `/` live filter in the commit list (title/SHA, full local history)
 - [x] README complete: usage, keymap, install, build-from-source
 - [x] `cargo fmt` + `cargo clippy -D warnings` clean
 **Done when:** clippy clean, README complete, mouse/resize verified. ✅
 Resize verified in a PTY at 40×12 and 100×30; 75 unit tests and 11 PTY tests pass.
+The `/` filter was completed alongside step 9; it searches title/SHA across
+the full local history and keeps pending picks when cleared.
 
-### Step 9 — install.sh
-- [ ] Detect OS/arch via `uname` → target triple + archive extension (mapping table below)
-- [ ] Modes: default = download latest release (`--tag vX.Y.Z` to pin,
+### Step 9 — install.sh ✅
+- [x] Detect OS/arch via `uname` → target triple + archive extension (mapping table below)
+- [x] Modes: default = download latest release (`--tag vX.Y.Z` to pin,
       `TAID_REPO=owner/name` to override); `--bin <path>` = offline install of a local
       binary; `--dry-run`
-- [ ] Download with curl (fallback wget), verify against `SHA256SUMS.txt`
-- [ ] Install to `~/.local/bin` (or `TAID_INSTALL_DIR`), make executable
-- [ ] PATH: if missing, append a marked `export PATH=` line to the right shell rc
+- [x] Download with curl (fallback wget), verify against `SHA256SUMS.txt`
+- [x] Install to `~/.local/bin` (or `TAID_INSTALL_DIR`), make executable
+- [x] PATH: if missing, append a marked `export PATH=` line to the right shell rc
       (zsh → `~/.zshrc`; bash → `~/.bashrc`, or `~/.bash_profile` on macOS; fallback
       `~/.profile`), idempotently; print next-step instructions
 **Done when:** `./install.sh --bin target/debug/taid` works locally (new shell finds
-`taid` on PATH); `--dry-run` prints the correct download URL for every platform.
+`taid` on PATH); `--dry-run --tag v0.1.0` prints the correct download URL for every
+platform. ✅ Offline install and new-shell PATH verified, all seven target URLs
+checked; download/checksum flow tested with a local release fixture (including
+checksum-mismatch refusal). The real release smoke test remains in step 10.
 
 ### Step 10 — CI + Release workflows + v0.1.0
 - [ ] `.github/workflows/ci.yml`: fmt + clippy + test on push/PR (ubuntu-latest)

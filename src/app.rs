@@ -253,6 +253,9 @@ pub struct EntryState {
     pub scroll: ScrollState,
     pub pick: Option<git2::Oid>,
     pub loaded: bool,
+    /// Visible row -> index in the full commit log.
+    pub visible: Vec<usize>,
+    pub filtered_for: String,
 }
 
 impl EntryState {
@@ -263,6 +266,8 @@ impl EntryState {
             scroll: ScrollState::new(0),
             pick: None,
             loaded: false,
+            visible: Vec::new(),
+            filtered_for: String::new(),
         }
     }
 }
@@ -292,6 +297,9 @@ pub struct App {
     pub hit_zones: Vec<(Rect, Hit)>,
     pub pane_heights: PaneHeights,
     pub should_quit: bool,
+    /// Case-insensitive title/SHA filter, shared by all repository panes.
+    pub filter: String,
+    pub filter_editing: bool,
 }
 
 impl App {
@@ -324,6 +332,8 @@ impl App {
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
+            filter: String::new(),
+            filter_editing: false,
         }
     }
 
@@ -350,6 +360,8 @@ impl App {
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
+            filter: String::new(),
+            filter_editing: false,
         };
         app.ensure_entry_loaded(0);
         app
@@ -407,6 +419,7 @@ impl App {
             Mode::NotRepo | Mode::Error => self.handle_message_key(key.code),
             Mode::Normal if self.save_popup.is_some() => self.handle_save_key(key.code),
             Mode::Normal if self.branch_popup.is_some() => self.handle_branch_key(key.code),
+            Mode::Normal if self.filter_editing => self.handle_filter_key(key.code, key.modifiers),
             Mode::Normal if self.popup.is_some() => match key.code {
                 KeyCode::Esc
                 | KeyCode::Enter
@@ -435,6 +448,10 @@ impl App {
             KeyCode::Char('r') | KeyCode::Char('R') => self.refresh(),
             KeyCode::Char('b') | KeyCode::Char('B') => self.open_branch_popup(),
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_save_popup(),
+            KeyCode::Char('/') => {
+                self.focus = Focus::Commits;
+                self.filter_editing = true;
+            }
             KeyCode::Tab | KeyCode::BackTab if self.has_submodules() => {
                 self.focus = self.focus.toggle()
             }
@@ -449,6 +466,73 @@ impl App {
             KeyCode::Enter if self.focus == Focus::Commits => self.toggle_pick(),
             _ => {}
         }
+    }
+
+    fn handle_filter_key(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        match code {
+            KeyCode::Enter => self.filter_editing = false,
+            KeyCode::Esc => {
+                self.filter_editing = false;
+                self.filter.clear();
+                self.apply_filter();
+            }
+            KeyCode::Backspace => {
+                self.filter.pop();
+                self.apply_filter();
+            }
+            KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                self.filter.clear();
+                self.apply_filter();
+            }
+            KeyCode::Char(c)
+                if !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.filter.push(c);
+                self.apply_filter();
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_filter(&mut self) {
+        let idx = self.repos.selected();
+        self.apply_filter_to_entry(idx);
+    }
+
+    fn apply_filter_to_entry(&mut self, idx: usize) {
+        let App {
+            repo,
+            sub_repos,
+            entries,
+            filter,
+            ..
+        } = self;
+        let Some(entry) = entries.get_mut(idx) else {
+            return;
+        };
+        if !filter.is_empty() {
+            let entry_repo = if idx == 0 {
+                repo.as_ref()
+            } else {
+                sub_repos.get(idx - 1).and_then(|r| r.as_ref())
+            };
+            if let Some(r) = entry_repo {
+                let _ = entry.log.ensure_loaded(r, entry.log.len());
+            }
+        }
+        let needle = filter.to_lowercase();
+        entry.visible = (0..entry.log.len())
+            .filter(|&i| {
+                needle.is_empty()
+                    || entry.log.get(i).is_some_and(|c| {
+                        c.title.to_lowercase().contains(&needle)
+                            || c.oid.to_string().contains(&needle)
+                            || c.short_sha.to_lowercase().contains(&needle)
+                    })
+            })
+            .collect();
+        entry.scroll = ScrollState::new(entry.visible.len());
+        entry.filtered_for = filter.clone();
     }
 
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -918,6 +1002,8 @@ impl App {
     /// are opened lazily and cached in `sub_repos`.
     fn ensure_entry_loaded(&mut self, idx: usize) {
         self.ensure_sub_repo(idx);
+        let filter = self.filter.clone();
+        let needle = filter.to_lowercase();
         let App {
             repo,
             sub_repos,
@@ -928,6 +1014,9 @@ impl App {
             return;
         };
         if entry.loaded {
+            if entry.filtered_for != filter {
+                self.apply_filter_to_entry(idx);
+            }
             return;
         }
         entry.loaded = true;
@@ -942,8 +1031,24 @@ impl App {
             let tips = gitx::history_tips(r);
             if let Ok(mut log) = CommitLog::load_from(r, &tips) {
                 let total = log.len();
-                let _ = log.ensure_loaded(r, INITIAL_WINDOW);
-                entry.scroll.set_len(total);
+                let limit = if needle.is_empty() {
+                    INITIAL_WINDOW
+                } else {
+                    total
+                };
+                let _ = log.ensure_loaded(r, limit);
+                entry.visible = (0..total)
+                    .filter(|&i| {
+                        needle.is_empty()
+                            || log.get(i).is_some_and(|c| {
+                                c.title.to_lowercase().contains(&needle)
+                                    || c.oid.to_string().contains(&needle)
+                                    || c.short_sha.to_lowercase().contains(&needle)
+                            })
+                    })
+                    .collect();
+                entry.scroll.set_len(entry.visible.len());
+                entry.filtered_for = filter;
                 entry.log = log;
             }
         }
@@ -955,7 +1060,15 @@ impl App {
         let idx = self.repos.selected();
         self.ensure_entry_loaded(idx);
         let needed = match self.entries.get(idx) {
-            Some(entry) => entry.scroll.selected() + self.pane_heights.commits.max(1) + 2,
+            Some(entry) => {
+                entry
+                    .visible
+                    .get(entry.scroll.selected() + self.pane_heights.commits.max(1) + 1)
+                    .or_else(|| entry.visible.last())
+                    .copied()
+                    .unwrap_or(0)
+                    + 1
+            }
             None => return,
         };
 
@@ -992,7 +1105,9 @@ impl App {
         let Some(entry) = self.entries.get_mut(idx) else {
             return;
         };
-        let row = entry.scroll.selected();
+        let Some(&row) = entry.visible.get(entry.scroll.selected()) else {
+            return;
+        };
         let Some(oid) = entry.log.get(row).map(|c| c.oid) else {
             return;
         };
@@ -1360,6 +1475,64 @@ mod tests {
         app.handle_key(key(KeyCode::Home));
         assert_eq!(app.entries[0].scroll.selected(), 0);
         assert!(app.entries[0].log.get(0).is_some());
+    }
+
+    #[test]
+    fn filter_searches_full_history_and_picks_matching_commit() {
+        let temp = TempDir::new("app-filter").unwrap();
+        let msgs: Vec<String> = (0..100).map(|i| format!("commit {i}")).collect();
+        let refs: Vec<&str> = msgs.iter().map(String::as_str).collect();
+        let (repo, _) = fixture::make_history(&temp.path().join("r"), &refs).unwrap();
+        let ov = crate::gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+        assert_eq!(app.entries[0].log.materialized(), INITIAL_WINDOW);
+
+        app.handle_key(key(KeyCode::Char('/')));
+        for c in "COMMIT 3".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert!(!app.filter_editing);
+        assert_eq!(app.entries[0].visible.len(), 11);
+        app.handle_key(key(KeyCode::End));
+        let original = *app.entries[0].visible.last().unwrap();
+        assert_eq!(app.entries[0].log.get(original).unwrap().title, "commit 3");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.entries[0].pick,
+            app.entries[0].log.get(original).map(|c| c.oid)
+        );
+
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.should_quit);
+        assert!(app.filter.is_empty());
+        assert_eq!(app.entries[0].visible.len(), 100);
+        assert!(app.entries[0].pick.is_some());
+    }
+
+    #[test]
+    fn filter_follows_repo_switches_and_refresh() {
+        let (mut app, _temp) = normal_app();
+        app.handle_key(key(KeyCode::Char('/')));
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Char('1')));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.entries[0].visible.len(), 0);
+
+        app.select_repo(1);
+        assert_eq!(app.entries[1].visible.len(), 1);
+        assert_eq!(
+            app.entries[1]
+                .log
+                .get(app.entries[1].visible[0])
+                .unwrap()
+                .title,
+            "a1"
+        );
+        app.refresh();
+        assert_eq!(app.filter, "a1");
+        assert_eq!(app.entries[1].visible.len(), 1);
     }
 
     #[test]

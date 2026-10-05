@@ -268,6 +268,28 @@ fn picking_a_commit_marks_it_and_quits() -> TestResult {
 }
 
 #[test]
+fn slash_filter_finds_and_picks_a_submodule_commit() -> TestResult {
+    let (_temp, root) = super_repo("pty-filter")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Select subA, focus commits, filter to its older commit, and pick it.
+    session.send("j\t/a1\r\rq")?;
+    let (status, raw) = session.finish();
+
+    assert!(status.expect("taid exits after q").success());
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(
+        screen.contains("matching /a"),
+        "filtered list rendered: {screen:?}"
+    );
+    assert!(
+        screen.contains("✓ pick"),
+        "matching commit picked: {screen:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn branch_switch_flow_end_to_end() -> TestResult {
     let (_temp, root) = super_repo("pty-branch")?;
     // A second branch to switch to.
