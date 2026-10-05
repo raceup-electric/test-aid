@@ -51,7 +51,7 @@ if [ -n "$local_bin" ]; then
     [ -x "$local_bin" ] || fail "binary is not executable: $local_bin"
     source_bin=$local_bin
 else
-    release_repo=${TAID_REPO:-riccardotoniolo/test-aid}
+    release_repo=${TAID_REPO:-raceup-electric/test-aid}
     case $release_repo in
         */*) ;;
         *) fail 'TAID_REPO must be owner/name' ;;

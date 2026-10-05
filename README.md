@@ -19,7 +19,7 @@ release, run `./install.sh` for the latest version or `./install.sh --tag
 v0.1.0` for a specific version. Release downloads are checked against
 `SHA256SUMS.txt`. Set `TAID_REPO=owner/name` to use a different release
 repository. `--dry-run` prints the target and URLs without changing files.
-Release binaries become available with step 10 of the plan.
+The default release repository is `raceup-electric/test-aid`.
 
 Alternatively, install from source with Cargo:
 
