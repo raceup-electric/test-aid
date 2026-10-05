@@ -27,12 +27,22 @@ pub fn install_panic_hook() {
 
 pub fn init() -> Result<Tui> {
     enable_raw_mode().context("taid needs an interactive terminal")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("preparing the terminal")?;
-    let mut terminal =
-        Terminal::new(CrosstermBackend::new(stdout)).context("preparing the terminal")?;
-    terminal.hide_cursor().context("preparing the terminal")?;
-    Ok(terminal)
+    let result = (|| {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+            .context("preparing the terminal")?;
+        let mut terminal =
+            Terminal::new(CrosstermBackend::new(stdout)).context("preparing the terminal")?;
+        terminal.hide_cursor().context("preparing the terminal")?;
+        Ok(terminal)
+    })();
+    if result.is_err() {
+        // EnterAlternateScreen may have succeeded before a later setup step
+        // failed, so restore both terminal modes on every partial failure.
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+    result
 }
 
 pub fn restore(terminal: &mut Tui) {

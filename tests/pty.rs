@@ -130,6 +130,23 @@ impl PtySession {
         Ok(())
     }
 
+    /// SGR mouse coordinates are one-based, unlike the app's hit zones.
+    fn click(&mut self, column: u16, row: u16) -> Result<(), BoxError> {
+        self.send(&format!(
+            "\u{1b}[<0;{column};{row}M\u{1b}[<0;{column};{row}m"
+        ))
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<(), BoxError> {
+        self._master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        Ok(())
+    }
+
     /// Wait for taid to exit (killing it at the deadline), then collect
     /// everything it wrote. `status` is `None` when the deadline forced a
     /// kill — every test treats that as a failure.
@@ -221,6 +238,19 @@ fn outside_a_repo_shows_popup_and_ok_exits() -> TestResult {
 }
 
 #[test]
+fn clicking_ok_exits_outside_a_repo() -> TestResult {
+    let temp = TempDir::new("pty-notrepo-click")?;
+    let mut session = PtySession::spawn(temp.path(), None)?;
+    session.wait_until_started()?;
+    session.click(40, 13)?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("clicking OK should exit");
+    assert!(status.success(), "raw output: {raw:?}");
+    Ok(())
+}
+
+#[test]
 fn picking_a_commit_marks_it_and_quits() -> TestResult {
     let (_temp, root) = super_repo("pty-pick")?;
     let mut session = PtySession::spawn(&root, None)?;
@@ -264,6 +294,32 @@ fn branch_switch_flow_end_to_end() -> TestResult {
     assert!(
         screen.contains("feature"),
         "branch listed/switched: {screen:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn clicking_branch_row_switches_branch() -> TestResult {
+    let (_temp, root) = super_repo("pty-branch-click")?;
+    let repo = taid::gitx::discover(&root)?.expect("repo");
+    let head = repo.head()?.peel_to_commit()?;
+    repo.branch("feature", &head, false)?;
+    drop(head);
+    drop(repo);
+
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    session.send("b")?;
+    session.click(20, 11)?; // first branch row in the centered popup
+    session.send("q")?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit after branch click");
+    assert!(status.success(), "raw output: {raw:?}");
+    let repo = taid::gitx::discover(&root)?.expect("repo");
+    assert_eq!(
+        taid::gitx::head_info(&repo)?,
+        taid::gitx::HeadInfo::Branch("feature".into())
     );
     Ok(())
 }
@@ -317,6 +373,49 @@ fn save_flow_end_to_end() -> TestResult {
         Some(a1.id()),
         "submodule workdir at a1"
     );
+    Ok(())
+}
+
+#[test]
+fn mouse_rows_and_apply_button_work_end_to_end() -> TestResult {
+    let (_temp, root) = super_repo("pty-mouse-save")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+
+    // At 80×24: subA is the second left row; the older commit is the
+    // second history row on the right. Mouse clicks select/focus those rows.
+    session.click(5, 4)?;
+    session.click(40, 6)?;
+    session.send("\rs")?; // pick selected commit, open Save
+    // The confirmation popup is 60×5 and centered; Apply is on its last row.
+    session.click(33, 13)?;
+    session.send("qq")?; // close result, quit
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit after clicking Apply");
+    assert!(status.success(), "raw output: {raw:?}");
+    let super_repo = taid::gitx::discover(&root)?.expect("super repo");
+    let ov = taid::gitx::overview(&super_repo)?;
+    let sub = taid::gitx::discover(&root.join("subA"))?.expect("sub repo");
+    let staged = ov.submodules[0].index_oid.expect("staged pointer");
+    assert_ne!(Some(staged), ov.submodules[0].recorded_oid);
+    assert_eq!(sub.head()?.target(), Some(staged));
+    Ok(())
+}
+
+#[test]
+fn resize_redraws_and_quits_cleanly() -> TestResult {
+    let (_temp, root) = super_repo("pty-resize")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    session.resize(40, 12)?;
+    session.resize(100, 30)?;
+    session.send("q")?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit after resizing");
+    assert!(status.success(), "raw output: {raw:?}");
+    assert!(String::from_utf8_lossy(&raw).contains("subA"));
     Ok(())
 }
 

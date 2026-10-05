@@ -208,13 +208,17 @@ everything untouched. ✅ Both verified end-to-end by pty tests against the real
 Test-found behaviors: picking the commit a repo is already on is a legitimate no-op
 checkout (not a conflict); fixture commits must be timestamped to sort as intended.
 
-### Step 8 — Polish & hardening
-- [ ] Mouse: click rows to select/focus, click buttons
-- [ ] Truncate long titles/paths with ellipsis; consistent color scheme
-- [ ] Optional: `/` filter in the commit list
-- [ ] README complete: usage, keymap, install, build-from-source
-- [ ] `cargo fmt` + `cargo clippy -D warnings` clean
-**Done when:** clippy clean, README complete, mouse/resize manually verified.
+### Step 8 — Polish & hardening ✅
+- [x] Mouse: click rows to select/focus, click buttons; verified against the
+      real binary with PTY mouse events (repo/commit rows, branch row, Apply,
+      and OK)
+- [x] Truncate long titles/paths by terminal-cell width with an ellipsis,
+      preserving Unicode grapheme clusters; consistent color scheme
+- [ ] Optional: `/` filter in the commit list (deferred)
+- [x] README complete: usage, keymap, install, build-from-source
+- [x] `cargo fmt` + `cargo clippy -D warnings` clean
+**Done when:** clippy clean, README complete, mouse/resize verified. ✅
+Resize verified in a PTY at 40×12 and 100×30; 75 unit tests and 11 PTY tests pass.
 
 ### Step 9 — install.sh
 - [ ] Detect OS/arch via `uname` → target triple + archive extension (mapping table below)

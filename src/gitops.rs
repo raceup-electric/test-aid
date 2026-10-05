@@ -223,6 +223,30 @@ mod tests {
     }
 
     #[test]
+    fn checkout_refuses_to_overwrite_staged_changes() -> Result<()> {
+        let temp = TempDir::new("checkout-staged-conflict")?;
+        let root = temp.path().join("repo");
+        let (repo, oids) = varying_history(&root)?;
+
+        fs::write(root.join("f.txt"), "staged\n")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("f.txt"))?;
+        index.write()?;
+        let staged_oid = index.get_path(Path::new("f.txt"), 0).unwrap().id;
+
+        let err = checkout_oid(&repo, oids[0]).expect_err("must preserve staged changes");
+        assert!(format!("{err:#}").contains("would be overwritten"));
+        assert_eq!(head_info(&repo)?, HeadInfo::Branch("main".into()));
+        assert_eq!(repo.head()?.target(), Some(oids[1]));
+        assert_eq!(fs::read_to_string(root.join("f.txt"))?, "staged\n");
+        assert_eq!(
+            repo.index()?.get_path(Path::new("f.txt"), 0).unwrap().id,
+            staged_oid
+        );
+        Ok(())
+    }
+
+    #[test]
     fn set_submodule_pointer_to_older_commit() -> Result<()> {
         let temp = TempDir::new("pointer-old")?;
         let super_root = temp.path().join("super");

@@ -921,6 +921,8 @@ dependencies = [
  "git2",
  "portable-pty",
  "ratatui",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

@@ -1035,6 +1035,11 @@ impl App {
         self.overview = Some(ov);
         self.sub_repos = (0..n).map(|_| None).collect();
         self.entries = entries;
+        for idx in 0..self.entries.len() {
+            if self.entries[idx].pick.is_some() && self.entries[idx].pick == self.current_oid(idx) {
+                self.entries[idx].pick = None;
+            }
+        }
         self.repos.set_len(1 + n);
         if n == 0 {
             self.focus = Focus::Commits;
@@ -1412,6 +1417,21 @@ mod tests {
             app.entries[0].log.find(pick).map(|c| c.title.as_str()),
             Some("root")
         );
+    }
+
+    #[test]
+    fn refresh_clears_pick_already_at_current_commit() {
+        let (mut app, _t) = normal_app();
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let pick = app.entries[0].pick.expect("pick set");
+
+        gitops::checkout_oid(app.repo.as_ref().unwrap(), pick).unwrap();
+        app.refresh();
+
+        assert_eq!(app.current_oid(0), Some(pick));
+        assert!(app.entries[0].pick.is_none());
     }
 
     #[test]

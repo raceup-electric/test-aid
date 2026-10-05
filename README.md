@@ -1,40 +1,84 @@
 # taid
 
-**taid** is a local-first terminal UI for managing which commits your repository
-records for its submodules — plus a quick way to time-travel through a repo's own
-history and switch branches, without ever touching the network.
-
-> **Status: work in progress.** See [PLAN.md](PLAN.md) for the roadmap and current
-> step. This README will grow as steps land.
-
-## What it will do
-
-Spawn `taid` in any directory:
-
-- **Not a git repo** → a popup tells you so, with an OK button.
-- **Git repo, no submodules** → browse history and check out any past commit
-  (future commits are never lost), switch branches.
-- **Git repo with submodules** → for each submodule, pick the commit the main
-  repository should record — the commit list shows hash, title and timestamp.
-  **Save** applies all picks; quitting without saving changes nothing.
-
-Everything stays local: no fetches, no pushes, no history rewrites. Choosing an
-older commit for a submodule only changes what the superproject records; the
-submodule's newer commits are untouched.
+**taid** is a local terminal UI for browsing Git history, switching local
+branches, and choosing which commits a repository records for its submodules.
+It never fetches, pushes, creates commits, or rewrites history.
 
 ## Install
 
-Coming in step 9: `install.sh` + prebuilt, dependency-free binaries for every
-major platform (static musl builds on Linux).
-
-## Build from source
+Until release binaries and `install.sh` are available, install from this checkout:
 
 ```sh
-cargo build --release
+cargo install --path . --locked
 ```
 
-Requires only a Rust toolchain — libgit2 is compiled into the binary, so there
-are no system dependencies to install.
+This places `taid` in Cargo's binary directory (normally `~/.cargo/bin`).
+You need Rust 1.85 or newer and a C build toolchain. The build vendors libgit2;
+it does not require a system libgit2 installation.
+
+To build without installing:
+
+```sh
+cargo build --release --locked
+./target/release/taid --version
+```
+
+## Usage
+
+Run `taid` from a Git repository or any directory inside one:
+
+```sh
+cd path/to/repository
+taid
+```
+
+The header shows the discovered repository root. With submodules, the left pane
+lists the main repository first, followed by its submodules; the right pane
+shows the selected repository's commits. Without submodules, the commit browser
+uses the full width. Each commit shows a short hash, its timestamp in the
+commit's own timezone, and its title.
+
+Select a commit with `Enter` to mark it as a pending pick. Press `s` to review
+the changes, then `Enter` or click **Apply** to save them. Closing the popup or
+quitting without applying leaves the picks unapplied. Save handles each pick in
+turn and reports successes and failures; failed picks remain available to retry.
+
+- For a **submodule**, Save checks out the selected commit in its working
+  directory with a detached HEAD and stages the new submodule pointer in the
+  main repository. It does not commit that staged change.
+- For the **main repository**, Save checks out the selected commit with a
+  detached HEAD. Local branches and newer commits remain intact.
+- Press `b` to switch the selected repository to a local branch. Switching a
+  submodule's branch alone does not stage a new pointer in the main repository.
+
+Checkout uses Git's safe mode: changes that would be overwritten cause an
+error. Uninitialized submodules are listed but cannot be edited; initialize
+one with `git submodule update --init <path>` outside taid.
+
+## Keys and mouse
+
+| Key | Action |
+| --- | --- |
+| `↑` / `↓` or `k` / `j` | Move in the focused list |
+| `PgUp` / `PgDn`, `Home` / `End` | Move by page or to either end |
+| `Tab` / `Shift+Tab` | Switch between repository and commit panes |
+| `Enter` | Pick or unpick a commit; confirm a popup action |
+| `b` | Open the local branch switcher |
+| `s` | Review and apply pending picks |
+| `r` | Refresh repository state |
+| `?` | Open help |
+| `q` / `Esc` | Close a popup or quit |
+| `Ctrl+C` | Quit |
+
+Click a repository or commit row to select and focus it. Click a branch row to
+switch to that branch, or use the popup buttons to apply, cancel, or acknowledge
+a result. The mouse wheel scrolls the focused list.
+
+## Scope
+
+Commit lists include history reachable from the current HEAD and local
+branches. taid does not contact remotes, initialize submodules, or manage
+nested submodules. See [PLAN.md](PLAN.md) for the development roadmap.
 
 ## License
 

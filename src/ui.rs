@@ -6,6 +6,9 @@
 
 use std::borrow::Cow;
 
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
+
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
@@ -14,6 +17,21 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::{self, App, Entry, Focus, Hit, Mode, Popup, SaveStage};
 use crate::gitx::HeadInfo;
+
+// The same colors carry the same meaning in every pane and popup.
+const ACCENT: Color = Color::Cyan;
+const CURRENT: Color = Color::Yellow;
+const PICKED: Color = Color::Green;
+const WARNING: Color = Color::Red;
+const MUTED: Color = Color::DarkGray;
+
+fn selected_style(focused: bool) -> Style {
+    if focused {
+        Style::new().bg(ACCENT).fg(Color::Black)
+    } else {
+        Style::new().bg(MUTED)
+    }
+}
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hit_zones.clear();
@@ -36,9 +54,9 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
     let popup = centered_fixed(46, 7, area);
     f.render_widget(Clear, popup);
     let border = if app.mode == Mode::Error {
-        Style::new().fg(Color::Red)
+        Style::new().fg(WARNING)
     } else {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(ACCENT)
     };
     let block = Block::bordered().title(" taid ").border_style(border);
     let inner = block.inner(popup);
@@ -52,11 +70,7 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
     .split(inner);
 
     let (title, detail, title_style) = if app.mode == Mode::Error {
-        (
-            "Cannot open this repository:",
-            app.message.clone(),
-            Color::Red,
-        )
+        ("Cannot open this repository:", app.message.clone(), WARNING)
     } else {
         (
             "This directory is not a git repository:",
@@ -81,7 +95,7 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
             Paragraph::new(label).style(
                 Style::new()
                     .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .bg(ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             Rect::new(x, row.y, w, 1),
@@ -137,29 +151,31 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let Some(ov) = &app.overview else {
         return;
     };
+    let head_text = format!("· {}", ov.head.describe());
+    let dirty_text = if ov.dirty { "  ● dirty" } else { "" };
+    let path_width = (area.width as usize).saturating_sub(
+        UnicodeWidthStr::width(" taid")
+            + UnicodeWidthStr::width(head_text.as_str())
+            + UnicodeWidthStr::width(dirty_text)
+            + 2,
+    );
     let mut spans = vec![
         Span::styled(
             " taid",
-            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" {} ", ov.root.display())),
+        Span::raw(format!(
+            " {} ",
+            ellipsize(&ov.root.display().to_string(), path_width)
+        )),
     ];
     spans.push(match &ov.head {
-        HeadInfo::Branch(_) => Span::styled(
-            format!("· {}", ov.head.describe()),
-            Style::new().fg(Color::Green),
-        ),
-        HeadInfo::Detached(_) => Span::styled(
-            format!("· {}", ov.head.describe()),
-            Style::new().fg(Color::Yellow),
-        ),
-        HeadInfo::Unborn(_) => Span::styled(
-            format!("· {}", ov.head.describe()),
-            Style::new().fg(Color::DarkGray),
-        ),
+        HeadInfo::Branch(_) => Span::styled(head_text, Style::new().fg(PICKED)),
+        HeadInfo::Detached(_) => Span::styled(head_text, Style::new().fg(CURRENT)),
+        HeadInfo::Unborn(_) => Span::styled(head_text, Style::new().fg(MUTED)),
     });
     if ov.dirty {
-        spans.push(Span::styled("  ● dirty", Style::new().fg(Color::Red)));
+        spans.push(Span::styled(dirty_text, Style::new().fg(WARNING)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -181,9 +197,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 
 fn pane_border(focused: bool) -> Style {
     if focused {
-        Style::new().fg(Color::Cyan)
+        Style::new().fg(ACCENT)
     } else {
-        Style::new().fg(Color::DarkGray)
+        Style::new().fg(MUTED)
     }
 }
 
@@ -207,60 +223,62 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
         let line = match app::entry_at(ov, idx) {
             Some(Entry::Main(m)) => {
                 let mut spans = vec![
-                    Span::styled(
-                        root_name(&m.root),
-                        Style::new().add_modifier(Modifier::BOLD),
-                    ),
                     Span::raw("  "),
-                    Span::styled(head_short(&m.head), Style::new().fg(Color::DarkGray)),
+                    Span::styled(head_short(&m.head), Style::new().fg(MUTED)),
                 ];
                 if pick.is_some() {
                     spans.push(Span::styled(
                         " ✓",
-                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        Style::new().fg(PICKED).add_modifier(Modifier::BOLD),
                     ));
                 }
                 spans.push(dirty_span(m.dirty));
+                let name_width =
+                    (inner.width as usize).saturating_sub(Line::from(spans.clone()).width());
+                spans.insert(
+                    0,
+                    Span::styled(
+                        ellipsize(&root_name(&m.root), name_width),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
+                );
                 Line::from(spans)
             }
             Some(Entry::Sub(sm)) => {
-                let mut spans = vec![Span::raw(sm.name.clone()), Span::raw("  ")];
+                let mut spans = vec![Span::raw("  ")];
                 if !sm.initialized {
-                    spans.push(Span::styled("not initialized", Style::new().fg(Color::Red)));
+                    spans.push(Span::styled("not initialized", Style::new().fg(WARNING)));
                 } else {
                     match sm.recorded_oid {
-                        Some(r) => {
-                            spans.push(Span::styled(short_oid(r), Style::new().fg(Color::Yellow)))
-                        }
-                        None => spans.push(Span::styled("?", Style::new().fg(Color::DarkGray))),
+                        Some(r) => spans.push(Span::styled(short_oid(r), Style::new().fg(CURRENT))),
+                        None => spans.push(Span::styled("?", Style::new().fg(MUTED))),
                     }
                     if sm.recorded_oid != sm.workdir_oid {
                         if let Some(w) = sm.workdir_oid {
                             spans.push(dim(" ≠"));
-                            spans.push(Span::styled(short_oid(w), Style::new().fg(Color::Cyan)));
+                            spans.push(Span::styled(short_oid(w), Style::new().fg(ACCENT)));
                         }
                     }
                 }
                 if pick.is_some() {
                     spans.push(Span::styled(
                         " ✓",
-                        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                        Style::new().fg(PICKED).add_modifier(Modifier::BOLD),
                     ));
                 }
                 if sm.dirty == Some(true) {
                     spans.push(dirty_span(true));
                 }
+                let name_width =
+                    (inner.width as usize).saturating_sub(Line::from(spans.clone()).width());
+                spans.insert(0, Span::raw(ellipsize(&sm.name, name_width)));
                 Line::from(spans)
             }
             None => continue,
         };
         let selected = app.repos.selected() == idx;
         let style = if selected {
-            if focused {
-                Style::new().bg(Color::Cyan).fg(Color::Black)
-            } else {
-                Style::new().bg(Color::DarkGray)
-            }
+            selected_style(focused)
         } else {
             Style::new()
         };
@@ -280,15 +298,18 @@ fn draw_commits_pane(f: &mut Frame, app: &mut App, area: Rect) {
     let selected = app.repos.selected();
 
     let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
-    let summary = summary_lines(app);
-    f.render_widget(
-        Paragraph::new(summary).wrap(Wrap { trim: false }),
-        chunks[0],
-    );
+    let summary: Vec<_> = summary_lines(app)
+        .into_iter()
+        .map(|line| ellipsize_line(line, chunks[0].width as usize))
+        .collect();
+    f.render_widget(Paragraph::new(summary), chunks[0]);
 
     let (title, empty_msg) = list_meta(app, selected);
     let block = Block::bordered()
-        .title(title)
+        .title(ellipsize(
+            &title,
+            (chunks[1].width as usize).saturating_sub(2),
+        ))
         .border_style(pane_border(focused));
     let inner = block.inner(chunks[1]);
 
@@ -310,23 +331,26 @@ fn draw_commits_pane(f: &mut Frame, app: &mut App, area: Rect) {
                     match entry.log.get(i) {
                         Some(c) => {
                             let (marker, color) = if entry.pick == Some(c.oid) {
-                                ('✓', Color::Green)
+                                ('✓', PICKED)
                             } else if recorded == Some(c.oid) {
-                                ('●', Color::Yellow)
+                                ('●', CURRENT)
                             } else if selected > 0 && Some(c.oid) == workdir {
-                                ('○', Color::DarkGray)
+                                ('○', MUTED)
                             } else {
                                 (' ', Color::Reset)
                             };
-                            let line = Line::from(vec![
+                            let mut spans = vec![
                                 Span::styled(marker.to_string(), Style::new().fg(color)),
                                 Span::raw(" "),
-                                Span::styled(c.short_sha.clone(), Style::new().fg(Color::Yellow)),
+                                Span::styled(c.short_sha.clone(), Style::new().fg(CURRENT)),
                                 Span::raw(" "),
-                                Span::styled(c.time_str(), Style::new().fg(Color::DarkGray)),
+                                Span::styled(c.time_str(), Style::new().fg(MUTED)),
                                 Span::raw(" "),
-                                Span::raw(c.title.clone()),
-                            ]);
+                            ];
+                            let title_width = (inner.width as usize)
+                                .saturating_sub(Line::from(spans.clone()).width());
+                            spans.push(Span::raw(ellipsize(&c.title, title_width)));
+                            let line = Line::from(spans);
                             RowDraw {
                                 line,
                                 selected: is_selected,
@@ -356,11 +380,7 @@ fn draw_commits_pane(f: &mut Frame, app: &mut App, area: Rect) {
     for (row, r) in rows.into_iter().enumerate() {
         let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         let style = if r.selected {
-            if focused {
-                Style::new().bg(Color::Cyan).fg(Color::Black)
-            } else {
-                Style::new().bg(Color::DarkGray)
-            }
+            selected_style(focused)
         } else {
             Style::new()
         };
@@ -427,15 +447,15 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
             if current != workdir {
                 if let Some(c) = current {
                     spans.push(dim("rec "));
-                    spans.push(Span::styled(short_oid(c), Style::new().fg(Color::Yellow)));
+                    spans.push(Span::styled(short_oid(c), Style::new().fg(CURRENT)));
                 }
                 if let Some(w) = workdir {
                     spans.push(dim(" ≠ wd "));
-                    spans.push(Span::styled(short_oid(w), Style::new().fg(Color::Cyan)));
+                    spans.push(Span::styled(short_oid(w), Style::new().fg(ACCENT)));
                 }
                 spans.push(dim(" · "));
             } else if let Some(c) = current {
-                spans.push(Span::styled(short_oid(c), Style::new().fg(Color::Yellow)));
+                spans.push(Span::styled(short_oid(c), Style::new().fg(CURRENT)));
                 spans.push(dim(" · "));
             }
             spans.push(status_span(sm.dirty.unwrap_or(false)));
@@ -444,7 +464,7 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
         Some(Entry::Sub(sm)) => vec![
             Span::styled(sm.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
             dim(" (submodule) · "),
-            Span::styled("not initialized", Style::new().fg(Color::Red)),
+            Span::styled("not initialized", Style::new().fg(WARNING)),
             dim(" · "),
             dim(format!(
                 "recorded {}",
@@ -465,17 +485,17 @@ fn pick_line(app: &App, idx: usize) -> Line<'static> {
     };
     let mut spans = vec![Span::styled(
         "✓ pick",
-        Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+        Style::new().fg(PICKED).add_modifier(Modifier::BOLD),
     )];
     spans.push(Span::styled(
         format!(" {}", short_oid(oid)),
-        Style::new().fg(Color::Yellow),
+        Style::new().fg(CURRENT),
     ));
     match app.entries.get(idx).and_then(|e| e.log.find(oid)) {
         Some(c) => {
             spans.push(Span::styled(
                 format!("  {}", c.time_str()),
-                Style::new().fg(Color::DarkGray),
+                Style::new().fg(MUTED),
             ));
             spans.push(Span::raw(format!("  {}", c.title)));
         }
@@ -524,8 +544,8 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
     let popup = centered_fixed(58, h, area);
     f.render_widget(Clear, popup);
     let block = Block::bordered()
-        .title(title)
-        .border_style(Style::new().fg(Color::Cyan));
+        .title(ellipsize(&title, (popup.width as usize).saturating_sub(2)))
+        .border_style(Style::new().fg(ACCENT));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -557,13 +577,17 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
     let hint_area = chunks[section];
 
     f.render_widget(
-        Paragraph::new(format!("HEAD: {head_desc}")).style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(ellipsize(
+            &format!("HEAD: {head_desc}"),
+            header_area.width as usize,
+        ))
+        .style(Style::new().fg(MUTED)),
         header_area,
     );
     if let (Some(a), Some(n)) = (notice_area, bp.notice.as_ref()) {
         f.render_widget(
             Paragraph::new(n.clone())
-                .style(Style::new().fg(Color::Red))
+                .style(Style::new().fg(WARNING))
                 .wrap(Wrap { trim: false }),
             a,
         );
@@ -579,19 +603,22 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
         let selected = bp.scroll.selected() == i;
         let mut spans = vec![Span::styled(
             if b.is_head { "● " } else { "  " },
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(CURRENT),
         )];
         spans.push(if b.is_head {
-            Span::styled(b.name.clone(), Style::new().fg(Color::Green))
+            Span::styled(b.name.clone(), Style::new().fg(PICKED))
         } else {
             Span::raw(b.name.clone())
         });
         let style = if selected {
-            Style::new().bg(Color::Cyan).fg(Color::Black)
+            selected_style(true)
         } else {
             Style::new()
         };
-        f.render_widget(Paragraph::new(Line::from(spans)).style(style), rect);
+        f.render_widget(
+            Paragraph::new(ellipsize_line(Line::from(spans), rect.width as usize)).style(style),
+            rect,
+        );
         app.hit_zones.push((rect, Hit::BranchRow(i)));
     }
 
@@ -600,13 +627,13 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
             Paragraph::new(
                 "switching a submodule's branch does not change what the main repo records",
             )
-            .style(Style::new().fg(Color::DarkGray))
+            .style(Style::new().fg(MUTED))
             .wrap(Wrap { trim: false }),
             a,
         );
     }
     f.render_widget(
-        Paragraph::new(" Enter switch · Esc close ").style(Style::new().fg(Color::DarkGray)),
+        Paragraph::new(" Enter switch · Esc close ").style(Style::new().fg(MUTED)),
         hint_area,
     );
 }
@@ -663,11 +690,11 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             let warns: Vec<&str> = changes.iter().filter_map(|c| c.warn.as_deref()).collect();
 
             let mut constraints: Vec<Constraint> = Vec::new();
-            constraints.extend(std::iter::repeat(Constraint::Length(1)).take(shown));
+            constraints.extend(std::iter::repeat_n(Constraint::Length(1), shown));
             if extra > 0 {
                 constraints.push(Constraint::Length(1));
             }
-            constraints.extend(std::iter::repeat(Constraint::Length(1)).take(warns.len()));
+            constraints.extend(std::iter::repeat_n(Constraint::Length(1), warns.len()));
             constraints.push(Constraint::Length(1)); // note
             constraints.push(Constraint::Length(1)); // buttons
 
@@ -680,7 +707,7 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             f.render_widget(Clear, popup);
             let block = Block::bordered()
                 .title(title)
-                .border_style(Style::new().fg(Color::Cyan));
+                .border_style(Style::new().fg(ACCENT));
             let inner = block.inner(popup);
             f.render_widget(block, popup);
             app.hit_zones.push((popup, Hit::SavePopup));
@@ -688,17 +715,28 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             let rows = Layout::vertical(constraints).split(inner);
             let mut r = 0;
             for c in changes.iter().take(shown) {
+                let reserved = UnicodeWidthStr::width("  ")
+                    + UnicodeWidthStr::width(c.old.as_str())
+                    + UnicodeWidthStr::width(" → ")
+                    + UnicodeWidthStr::width(c.new.as_str());
+                let name_width = (rows[r].width as usize).saturating_sub(reserved);
                 let mut spans = vec![
-                    Span::styled(c.name.clone(), Style::new().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        ellipsize(&c.name, name_width),
+                        Style::new().add_modifier(Modifier::BOLD),
+                    ),
                     dim("  "),
-                    Span::styled(c.old.clone(), Style::new().fg(Color::Yellow)),
+                    Span::styled(c.old.clone(), Style::new().fg(CURRENT)),
                     dim(" → "),
-                    Span::styled(c.new.clone(), Style::new().fg(Color::Green)),
+                    Span::styled(c.new.clone(), Style::new().fg(PICKED)),
                 ];
                 if let Some(t) = &c.title {
                     spans.push(dim(format!("  {t}")));
                 }
-                f.render_widget(Paragraph::new(Line::from(spans)), rows[r]);
+                f.render_widget(
+                    Paragraph::new(ellipsize_line(Line::from(spans), rows[r].width as usize)),
+                    rows[r],
+                );
                 r += 1;
             }
             if extra > 0 {
@@ -707,7 +745,8 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             }
             for w in warns {
                 f.render_widget(
-                    Paragraph::new(format!("⚠ {w}")).style(Style::new().fg(Color::Yellow)),
+                    Paragraph::new(ellipsize(&format!("⚠ {w}"), rows[r].width as usize))
+                        .style(Style::new().fg(CURRENT)),
                     rows[r],
                 );
                 r += 1;
@@ -775,21 +814,20 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
                 Block::bordered()
                     .title(" Save result ")
                     .border_style(if failed.is_empty() {
-                        Style::new().fg(Color::Green)
+                        Style::new().fg(PICKED)
                     } else {
-                        Style::new().fg(Color::Red)
+                        Style::new().fg(WARNING)
                     });
             let inner = block.inner(popup);
             f.render_widget(block, popup);
             app.hit_zones.push((popup, Hit::SavePopup));
 
-            let mut constraints: Vec<Constraint> = std::iter::repeat(Constraint::Length(1))
-                .take(shown_applied)
-                .collect();
+            let mut constraints: Vec<Constraint> =
+                std::iter::repeat_n(Constraint::Length(1), shown_applied).collect();
             if applied.len() > shown_applied {
                 constraints.push(Constraint::Length(1));
             }
-            constraints.extend(std::iter::repeat(Constraint::Length(3)).take(shown_failed));
+            constraints.extend(std::iter::repeat_n(Constraint::Length(3), shown_failed));
             if failed.len() > shown_failed {
                 constraints.push(Constraint::Length(1));
             }
@@ -802,7 +840,8 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             let mut r = 0;
             for msg in applied.iter().take(shown_applied) {
                 f.render_widget(
-                    Paragraph::new(format!("✓ {msg}")).style(Style::new().fg(Color::Green)),
+                    Paragraph::new(ellipsize(&format!("✓ {msg}"), rows[r].width as usize))
+                        .style(Style::new().fg(PICKED)),
                     rows[r],
                 );
                 r += 1;
@@ -817,7 +856,7 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             for (name, err) in failed.iter().take(shown_failed) {
                 f.render_widget(
                     Paragraph::new(vec![
-                        Line::from(format!("✗ {name}")).style(Style::new().fg(Color::Red)),
+                        Line::from(format!("✗ {name}")).style(Style::new().fg(WARNING)),
                         Line::from(format!("  {err}")).dim(),
                     ])
                     .wrap(Wrap { trim: false }),
@@ -877,7 +916,7 @@ fn draw_button(
         Paragraph::new(label).style(
             Style::new()
                 .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(ACCENT)
                 .add_modifier(Modifier::BOLD),
         ),
         rect,
@@ -891,7 +930,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     f.render_widget(Clear, popup);
     let block = Block::bordered()
         .title(" Help ")
-        .border_style(Style::new().fg(Color::Cyan));
+        .border_style(Style::new().fg(ACCENT));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -913,7 +952,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
     ];
     for (k, d) in keys {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {k:<22}"), Style::new().fg(Color::Cyan)),
+            Span::styled(format!("  {k:<22}"), Style::new().fg(ACCENT)),
             Span::raw(*d),
         ]));
     }
@@ -928,32 +967,80 @@ fn draw_help(f: &mut Frame, area: Rect) {
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+/// Clip by terminal cells, keeping Unicode grapheme clusters intact.
+fn take_cells(text: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut used = 0;
+    for grapheme in UnicodeSegmentation::graphemes(text, true) {
+        let width = UnicodeWidthStr::width(grapheme);
+        if used + width > max_width {
+            break;
+        }
+        result.push_str(grapheme);
+        used += width;
+    }
+    result
+}
+
+fn ellipsize(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    format!("{}…", take_cells(text, max_width - 1))
+}
+
+fn ellipsize_line(line: Line<'static>, max_width: usize) -> Line<'static> {
+    if line.width() <= max_width {
+        return line;
+    }
+    if max_width == 0 {
+        return Line::from("");
+    }
+    let mut remaining = max_width - 1;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let prefix = take_cells(&span.content, remaining);
+        remaining -= UnicodeWidthStr::width(prefix.as_str());
+        if !prefix.is_empty() {
+            spans.push(Span::styled(prefix, span.style));
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    spans.push(Span::styled("…", Style::new().fg(MUTED)));
+    Line::from(spans)
+}
+
 fn dim(s: impl Into<Cow<'static, str>>) -> Span<'static> {
-    Span::styled(s, Style::new().fg(Color::DarkGray))
+    Span::styled(s, Style::new().fg(MUTED))
 }
 
 fn head_span(h: &HeadInfo) -> Span<'static> {
     match h {
-        HeadInfo::Branch(b) => Span::styled(b.clone(), Style::new().fg(Color::Green)),
+        HeadInfo::Branch(b) => Span::styled(b.clone(), Style::new().fg(PICKED)),
         HeadInfo::Detached(oid) => Span::styled(
             format!("{} (detached)", short_oid(*oid)),
-            Style::new().fg(Color::Yellow),
+            Style::new().fg(CURRENT),
         ),
-        HeadInfo::Unborn(_) => Span::styled("no commits yet", Style::new().fg(Color::DarkGray)),
+        HeadInfo::Unborn(_) => Span::styled("no commits yet", Style::new().fg(MUTED)),
     }
 }
 
 fn status_span(dirty: bool) -> Span<'static> {
     if dirty {
-        Span::styled("● dirty", Style::new().fg(Color::Red))
+        Span::styled("● dirty", Style::new().fg(WARNING))
     } else {
-        Span::styled("clean", Style::new().fg(Color::Green))
+        Span::styled("clean", Style::new().fg(PICKED))
     }
 }
 
 fn dirty_span(dirty: bool) -> Span<'static> {
     if dirty {
-        Span::styled(" ●", Style::new().fg(Color::Red))
+        Span::styled(" ●", Style::new().fg(WARNING))
     } else {
         Span::raw("")
     }
@@ -1409,6 +1496,35 @@ mod tests {
         assert!(text.contains('✗'));
         assert!(text.contains("subC"));
         assert!(text.contains("cannot update: dirty"));
+    }
+
+    #[test]
+    fn ellipsis_respects_cell_width_and_graphemes() {
+        assert_eq!(ellipsize("abcdefgh", 5), "abcd…");
+        assert_eq!(ellipsize("abcdefgh", 1), "…");
+        assert_eq!(ellipsize("abcdefgh", 0), "");
+        assert_eq!(ellipsize("東京大阪", 5), "東京…");
+        assert_eq!(ellipsize("e\u{301}clair", 2), "e\u{301}…");
+        assert!(UnicodeWidthStr::width(ellipsize("東京大阪", 5).as_str()) <= 5);
+    }
+
+    #[test]
+    fn long_paths_and_titles_show_ellipsis_without_hiding_state() {
+        let temp = TempDir::new("ui-long-title").unwrap();
+        let title = "a very long commit title that runs beyond the terminal width";
+        let (repo, _) = fixture::make_history(&temp.path().join("repo"), &[title]).unwrap();
+        let ov = gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+        app.overview.as_mut().unwrap().root =
+            std::path::PathBuf::from(format!("/{}", "very-long-directory-name/".repeat(7)));
+
+        let buf = render(&mut app, 50, 15);
+        let text = screen_text(&buf);
+        let header = text.lines().next().unwrap();
+        let commit = text.lines().nth(4).unwrap();
+        assert!(header.contains('…') && header.contains("main"), "{header}");
+        assert!(commit.contains('…'), "{commit}");
+        assert!(!commit.contains(title), "{commit}");
     }
 
     #[test]
