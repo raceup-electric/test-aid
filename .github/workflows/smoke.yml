@@ -1,0 +1,27 @@
+name: Release smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to install
+        required: true
+        default: v0.1.0
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the published release through install.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAID_INSTALL_DIR: ${{ runner.temp }}/taid-smoke/bin
+          TAG: ${{ inputs.tag }}
+        run: |
+          export PATH="$TAID_INSTALL_DIR:$PATH"
+          ./install.sh --tag "$TAG"
+          "$TAID_INSTALL_DIR/taid" --version | grep -Fx "taid ${TAG#v}"
