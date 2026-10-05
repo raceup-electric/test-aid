@@ -238,20 +238,22 @@ platform. ✅ Offline install and new-shell PATH verified, all seven target URLs
 checked; download/checksum flow tested with a local release fixture (including
 checksum-mismatch refusal). The real release smoke test remains in step 10.
 
-### Step 10 — CI + Release workflows + v0.1.0
-- [ ] `.github/workflows/ci.yml`: fmt + clippy + test on push/PR (ubuntu-latest)
-- [ ] `.github/workflows/release.yml` on tag `v*`: build matrix (table below), package
+### Step 10 — CI + Release workflows + v0.1.0 ✅
+- [x] `.github/workflows/ci.yml`: fmt + clippy + test on push/PR (ubuntu-latest)
+- [x] `.github/workflows/release.yml` on tag `v*`: build matrix (table below), package
       `taid-<tag>-<target>.tar.gz|.zip` (containing `taid[.exe]`, README, LICENSE),
       aggregate `SHA256SUMS.txt`, create the GitHub Release
-- [ ] Tag `v0.1.0` and publish
-- [ ] Smoke-test: download artifacts, run `--version`; verify `install.sh` download
-      mode against the real release
+- [x] Tag `v0.1.0` and publish
+- [x] Smoke-test: download artifacts, run `--version`; verify `install.sh` download
+      mode against the real private release on Linux and macOS with a scoped
+      GitHub Actions token
 **Done when:** the release page lists all artifacts + checksums and `install.sh`
-installs from it.
+installs from it. ✅ Seven archives and `SHA256SUMS.txt` published; all seven
+matrix builds and both installer smoke jobs passed.
 
-> Prerequisite for step 10: the repo must be pushed to GitHub. Create the remote repo
-> and tell me the `owner/name` slug (or grant me `gh` access) — I'll wire the remote.
-> Steps 1–9 work fully offline.
+The repository is private; downloading its release requires a GitHub token with
+Contents read access (`GH_TOKEN`). If it becomes public, the installer also
+supports unauthenticated downloads.
 
 ## 5. Release matrix
 
@@ -260,10 +262,10 @@ installs from it.
 | `x86_64-unknown-linux-musl` | ubuntu-latest | cargo-zigbuild (fully static) | `.tar.gz` |
 | `aarch64-unknown-linux-musl` | ubuntu-latest | cargo-zigbuild (fully static) | `.tar.gz` |
 | `armv7-unknown-linux-musleabihf` | ubuntu-latest | cargo-zigbuild | `.tar.gz` |
-| `x86_64-apple-darwin` | macos-latest | rustup target add (Xcode cross) | `.tar.gz` |
-| `aarch64-apple-darwin` | macos-latest | native | `.tar.gz` |
+| `x86_64-apple-darwin` | macos-15-intel | native | `.tar.gz` |
+| `aarch64-apple-darwin` | macos-15 | native | `.tar.gz` |
 | `x86_64-pc-windows-msvc` | windows-latest | native | `.zip` |
-| `aarch64-pc-windows-msvc` | windows-latest | rustup target add (MSVC ARM64) | `.zip` |
+| `aarch64-pc-windows-msvc` | windows-11-arm | native | `.zip` |
 
 `install.sh` platform mapping:
 
