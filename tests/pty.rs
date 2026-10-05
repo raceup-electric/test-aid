@@ -238,6 +238,37 @@ fn picking_a_commit_marks_it_and_quits() -> TestResult {
 }
 
 #[test]
+fn branch_switch_flow_end_to_end() -> TestResult {
+    let (_temp, root) = super_repo("pty-branch")?;
+    // A second branch to switch to.
+    let repo = taid::gitx::discover(&root)?.expect("repo");
+    {
+        let head = repo.head()?.peel_to_commit()?;
+        repo.branch("feature", &head, false)?;
+    }
+    drop(repo);
+
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // b → popup, Enter → switch to `feature` (row 0), q → quit.
+    session.send("b\rq")?;
+    let (status, raw) = session.finish();
+
+    let status = status.expect("taid should exit on its own after q");
+    assert!(status.success(), "raw output: {raw:?}");
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(
+        screen.contains("Branches — super"),
+        "popup rendered: {screen:?}"
+    );
+    assert!(
+        screen.contains("feature"),
+        "branch listed/switched: {screen:?}"
+    );
+    Ok(())
+}
+
+#[test]
 fn panic_restores_the_terminal_before_printing() -> TestResult {
     if !cfg!(debug_assertions) {
         // The TAID_PANIC_TEST hook only exists in debug builds.

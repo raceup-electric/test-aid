@@ -125,6 +125,9 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
     if app.popup == Some(Popup::Help) {
         draw_help(f, area);
     }
+    if app.branch_popup.is_some() {
+        draw_branch_popup(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -159,7 +162,9 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let text = if app.popup.is_some() {
+    let text = if app.branch_popup.is_some() {
+        " ↑↓ select · Enter switch · Esc close "
+    } else if app.popup.is_some() {
         " Esc — close "
     } else if app.has_submodules() {
         " ↑↓/jk move · Tab/←→ panes · Enter pick · r refresh · ? help · q quit "
@@ -474,6 +479,133 @@ fn pick_line(app: &App, idx: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The branch switcher (`b`): local branches of the selected entry, with the
+/// current one marked. On submodules it carries a footnote: switching their
+/// branch does not change what the main repository records.
+fn draw_branch_popup(f: &mut Frame, app: &mut App) {
+    let area = f.area();
+    let Some(bp) = app.branch_popup.as_ref() else {
+        return;
+    };
+    let Some(ov) = app.overview.as_ref() else {
+        return;
+    };
+
+    let (title, head_desc, is_sub) = match app::entry_at(ov, bp.entry_idx) {
+        Some(Entry::Main(m)) => (
+            format!(" Branches — {} ", root_name(&m.root)),
+            m.head.describe(),
+            false,
+        ),
+        Some(Entry::Sub(sm)) => (
+            format!(" Branches — {} ", sm.name),
+            sm.head
+                .as_ref()
+                .map(|h| h.describe())
+                .unwrap_or_else(|| "not initialized".to_string()),
+            true,
+        ),
+        None => return,
+    };
+
+    let list_h = (bp.branches.len() as u16).clamp(1, 12);
+    let mut h = 3 + 1 + list_h + 1; // borders + header + list + hint
+    if bp.notice.is_some() {
+        h += 2;
+    }
+    if is_sub {
+        h += 2; // the footnote wraps to two lines at this width
+    }
+    let popup = centered_fixed(58, h, area);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(title)
+        .border_style(Style::new().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let mut constraints = vec![Constraint::Length(1)];
+    if bp.notice.is_some() {
+        constraints.push(Constraint::Length(2));
+    }
+    constraints.push(Constraint::Length(list_h));
+    if is_sub {
+        constraints.push(Constraint::Length(2));
+    }
+    constraints.push(Constraint::Length(1));
+    let chunks = Layout::vertical(constraints).split(inner);
+    let mut section = 0;
+    let header_area = chunks[section];
+    section += 1;
+    let notice_area = bp.notice.is_some().then(|| {
+        let a = chunks[section];
+        section += 1;
+        a
+    });
+    let list_area = chunks[section];
+    section += 1;
+    let footnote_area = is_sub.then(|| {
+        let a = chunks[section];
+        section += 1;
+        a
+    });
+    let hint_area = chunks[section];
+
+    f.render_widget(
+        Paragraph::new(format!("HEAD: {head_desc}")).style(Style::new().fg(Color::DarkGray)),
+        header_area,
+    );
+    if let (Some(a), Some(n)) = (notice_area, bp.notice.as_ref()) {
+        f.render_widget(
+            Paragraph::new(n.clone())
+                .style(Style::new().fg(Color::Red))
+                .wrap(Wrap { trim: false }),
+            a,
+        );
+    }
+
+    let (offset, count) = bp.scroll.visible(list_h as usize);
+    for r in 0..count {
+        let i = offset + r;
+        let Some(b) = bp.branches.get(i) else {
+            continue;
+        };
+        let rect = Rect::new(list_area.x, list_area.y + r as u16, list_area.width, 1);
+        let selected = bp.scroll.selected() == i;
+        let mut spans = vec![Span::styled(
+            if b.is_head { "● " } else { "  " },
+            Style::new().fg(Color::Yellow),
+        )];
+        spans.push(if b.is_head {
+            Span::styled(b.name.clone(), Style::new().fg(Color::Green))
+        } else {
+            Span::raw(b.name.clone())
+        });
+        let style = if selected {
+            Style::new().bg(Color::Cyan).fg(Color::Black)
+        } else {
+            Style::new()
+        };
+        f.render_widget(Paragraph::new(Line::from(spans)).style(style), rect);
+        app.hit_zones.push((rect, Hit::BranchRow(i)));
+    }
+
+    if let Some(a) = footnote_area {
+        f.render_widget(
+            Paragraph::new(
+                "switching a submodule's branch does not change what the main repo records",
+            )
+            .style(Style::new().fg(Color::DarkGray))
+            .wrap(Wrap { trim: false }),
+            a,
+        );
+    }
+    f.render_widget(
+        Paragraph::new(" Enter switch · Esc close ").style(Style::new().fg(Color::DarkGray)),
+        hint_area,
+    );
+}
+
 fn draw_help(f: &mut Frame, area: Rect) {
     let popup = centered_rect(70, 90, area);
     f.render_widget(Clear, popup);
@@ -491,6 +623,7 @@ fn draw_help(f: &mut Frame, area: Rect) {
             "Enter",
             "pick / un-pick the commit the main repository records",
         ),
+        ("b", "switch branch of the selected repo / submodule"),
         ("r", "refresh repository state"),
         ("click / wheel", "select rows, focus panes, scroll"),
         ("?", "toggle this help"),
@@ -639,6 +772,35 @@ mod tests {
             ],
         )
         .unwrap();
+        let ov = gitx::overview(&sup.repo).unwrap();
+        (App::normal(ov, sup.repo), temp)
+    }
+
+    /// Like `make_normal_app`, plus a `feature` branch on the main repo and
+    /// an `old` branch on subA (for branch-switcher tests).
+    fn make_branchy_app() -> (App, TempDir) {
+        let temp = TempDir::new("ui-branch").unwrap();
+        let sup = fixture::make_super(
+            &temp.path().join("super"),
+            &[SubSpec {
+                name: "subA",
+                msgs: &["a1", "a2"],
+                recorded: None,
+                drop_workdir: false,
+            }],
+        )
+        .unwrap();
+        {
+            let head = sup.repo.head().unwrap().peel_to_commit().unwrap();
+            sup.repo.branch("feature", &head, false).unwrap();
+        }
+        let sub = gitx::discover(&temp.path().join("super/subA"))
+            .unwrap()
+            .unwrap();
+        let a1 = sup.sub_oids["subA"][0];
+        let c1 = sub.find_commit(a1).unwrap();
+        sub.branch("old", &c1, false).unwrap();
+
         let ov = gitx::overview(&sup.repo).unwrap();
         (App::normal(ov, sup.repo), temp)
     }
@@ -832,6 +994,57 @@ mod tests {
     }
 
     #[test]
+    fn branch_popup_renders_branches_current_and_hints() {
+        let (mut app, _t) = make_branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(text.contains("Branches — super"), "title: {text}");
+        assert!(text.contains("feature") && text.contains("main"));
+        assert!(text.contains('●'), "current-branch marker");
+        assert!(text.contains("Enter switch"), "hint line");
+        assert!(!text.contains("does not change what the main repo records"));
+    }
+
+    #[test]
+    fn branch_popup_on_submodule_shows_footnote() {
+        let (mut app, _t) = make_branchy_app();
+        app.select_repo(1); // subA
+        app.handle_key(key(KeyCode::Char('b')));
+
+        let buf = render(&mut app, 80, 24);
+        let text = screen_text(&buf);
+        assert!(text.contains("Branches — subA"), "title: {text}");
+        assert!(
+            text.contains("does not change what the") && text.contains("main repo records"),
+            "footnote (may wrap): {text}"
+        );
+    }
+
+    #[test]
+    fn clicking_rendered_branch_row_switches() {
+        let (mut app, _t) = make_branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        render(&mut app, 80, 24);
+
+        // Row 0 is `feature`.
+        let (rect, _) = app
+            .hit_zones
+            .iter()
+            .find(|(_, h)| *h == Hit::BranchRow(0))
+            .copied()
+            .unwrap();
+        app.handle_mouse(click(rect.x + 3, rect.y));
+
+        assert!(app.branch_popup.is_none(), "popup closed after switch");
+        assert_eq!(
+            app.overview.as_ref().unwrap().head,
+            crate::gitx::HeadInfo::Branch("feature".into())
+        );
+    }
+
+    #[test]
     fn small_terminal_does_not_panic() {
         let (mut app, _t) = make_normal_app();
         for (w, h) in [(0, 0), (1, 1), (2, 2), (10, 4), (20, 6), (80, 24)] {
@@ -840,6 +1053,12 @@ mod tests {
         let mut nr = App::not_repo(Path::new("/x"));
         for (w, h) in [(0, 0), (2, 2), (10, 4)] {
             render(&mut nr, w, h);
+        }
+        // The branch popup must tolerate tiny screens too.
+        let (mut bapp, _t) = make_branchy_app();
+        bapp.handle_key(key(KeyCode::Char('b')));
+        for (w, h) in [(0, 0), (2, 2), (10, 4), (20, 6), (80, 24)] {
+            render(&mut bapp, w, h);
         }
     }
 }

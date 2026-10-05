@@ -167,13 +167,23 @@ after exit and after an induced panic. ✅ (36 unit tests + 3 pty tests)
 **Done when:** listing matches `git log --oneline` ground truth in a fixture repo;
 markers and layout correct. ✅ (50 unit + 4 pty tests)
 
-### Step 6 — Branch switcher
-- [ ] `b` opens a popup for the repo selected in the left pane
-- [ ] List local branches (current one marked; detached-HEAD state shown)
-- [ ] `Enter` switches branch, `Esc` cancels; state refreshes everywhere
-- [ ] Footnote in the popup when used on a submodule: *switching a submodule's branch
-      does not change what the main repo records*
-**Done when:** branch switch verified on main repo and submodule fixtures; UI refreshes.
+### Step 6 — Branch switcher ✅
+- [x] `b` opens a popup for the repo selected in the left pane (main repo or
+      submodule; works in single-pane mode too)
+- [x] List local branches alphabetical with the current one marked `●`; popup
+      header shows the current HEAD (branch / detached / unborn)
+- [x] `Enter` switches branch (SAFE checkout — refused with a clear message on
+      a dirty tree, popup stays open showing the error), `Esc`/`q` cancels;
+      full state refresh after a successful switch (picks survive)
+- [x] Mouse: click a branch row to select+switch, click elsewhere to close;
+      wheel scrolls the popup
+- [x] Uninitialized submodules and unborn HEADs get a notice instead of a list
+- [x] Footnote on submodules: *switching a submodule's branch does not change
+      what the main repo records* (verified: superproject pointer untouched)
+- [x] Test-found behaviors: a same-commit branch switch legitimately succeeds
+      on a dirty tree (mirrors git); the dirty-refusal test now uses branches
+      at different trees
+**Done when:** branch switch verified on main repo and submodule fixtures; UI refreshes. ✅ (61 unit + 5 pty tests)
 
 ### Step 7 — Save flow
 - [ ] Pending-picks model (per repo: chosen OID vs recorded)

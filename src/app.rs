@@ -13,6 +13,7 @@ use crossterm::event::{
 use git2::Repository;
 use ratatui::layout::Rect;
 
+use crate::gitops::{self, BranchEntry};
 use crate::gitx::{self, CommitLog, RepoOverview, SubmoduleEntry};
 
 /// Commits materialized when an entry is first opened.
@@ -56,6 +57,16 @@ pub enum Popup {
     Help,
 }
 
+/// State of the branch-switcher popup (`b`): the entry it acts on, that
+/// entry's local branches, and a notice line (info or switch error).
+pub struct BranchPopup {
+    /// Index into the repos list (0 = main repository).
+    pub entry_idx: usize,
+    pub branches: Vec<BranchEntry>,
+    pub scroll: ScrollState,
+    pub notice: Option<String>,
+}
+
 /// A clickable region, registered by the renderer each frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
@@ -63,6 +74,7 @@ pub enum Hit {
     PaneCommits,
     RepoRow(usize),
     CommitRow(usize),
+    BranchRow(usize),
     OkButton,
 }
 
@@ -238,6 +250,7 @@ pub struct App {
     /// Selection inside the left pane (main repo + submodules).
     pub repos: ScrollState,
     pub popup: Option<Popup>,
+    pub branch_popup: Option<BranchPopup>,
     /// Clickable regions, refreshed by the renderer every frame.
     pub hit_zones: Vec<(Rect, Hit)>,
     pub pane_heights: PaneHeights,
@@ -269,6 +282,7 @@ impl App {
             focus: Focus::Repos,
             repos: ScrollState::new(0),
             popup: None,
+            branch_popup: None,
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
@@ -293,6 +307,7 @@ impl App {
             focus: if n == 0 { Focus::Commits } else { Focus::Repos },
             repos: ScrollState::new(1 + n),
             popup: None,
+            branch_popup: None,
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
@@ -351,6 +366,7 @@ impl App {
         }
         match self.mode {
             Mode::NotRepo | Mode::Error => self.handle_message_key(key.code),
+            Mode::Normal if self.branch_popup.is_some() => self.handle_branch_key(key.code),
             Mode::Normal if self.popup.is_some() => match key.code {
                 KeyCode::Esc
                 | KeyCode::Enter
@@ -377,6 +393,7 @@ impl App {
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('?') => self.popup = Some(Popup::Help),
             KeyCode::Char('r') | KeyCode::Char('R') => self.refresh(),
+            KeyCode::Char('b') | KeyCode::Char('B') => self.open_branch_popup(),
             KeyCode::Tab | KeyCode::BackTab if self.has_submodules() => {
                 self.focus = self.focus.toggle()
             }
@@ -406,6 +423,10 @@ impl App {
         if self.mode != Mode::Normal || self.popup.is_some() {
             return;
         }
+        if self.branch_popup.is_some() {
+            self.branch_scroll(dir * WHEEL_STEP);
+            return;
+        }
         match self.focus {
             Focus::Repos => {
                 self.repos.move_by(dir);
@@ -423,6 +444,20 @@ impl App {
     }
 
     fn handle_click(&mut self, col: u16, row: u16) {
+        // Branch popup: clicking a row selects and switches; anything else
+        // just closes it.
+        if self.mode == Mode::Normal && self.branch_popup.is_some() {
+            match self.hit_test(col, row) {
+                Some(Hit::BranchRow(i)) => {
+                    if let Some(bp) = self.branch_popup.as_mut() {
+                        bp.scroll.select(i);
+                    }
+                    self.switch_selected_branch();
+                }
+                _ => self.branch_popup = None,
+            }
+            return;
+        }
         // While a popup is open, any click dismisses it and goes no further.
         if self.mode == Mode::Normal && self.popup.is_some() {
             self.popup = None;
@@ -471,6 +506,114 @@ impl App {
             })
             .min_by_key(|(rect, _)| rect.width * rect.height)
             .map(|(_, hit)| *hit)
+    }
+
+    // ---- branch switcher -------------------------------------------------
+
+    /// Rows per page inside the branch popup.
+    const BRANCH_PAGE: i32 = 8;
+
+    fn handle_branch_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.branch_popup = None,
+            KeyCode::Up | KeyCode::Char('k') => self.branch_scroll(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.branch_scroll(1),
+            KeyCode::PageUp => self.branch_scroll(-Self::BRANCH_PAGE),
+            KeyCode::PageDown => self.branch_scroll(Self::BRANCH_PAGE),
+            KeyCode::Home => {
+                if let Some(bp) = self.branch_popup.as_mut() {
+                    bp.scroll.first();
+                }
+            }
+            KeyCode::End => {
+                if let Some(bp) = self.branch_popup.as_mut() {
+                    bp.scroll.last();
+                }
+            }
+            KeyCode::Enter => self.switch_selected_branch(),
+            _ => {}
+        }
+    }
+
+    fn branch_scroll(&mut self, delta: i32) {
+        if let Some(bp) = self.branch_popup.as_mut() {
+            bp.scroll.move_by(delta);
+        }
+    }
+
+    /// Open the branch switcher for the entry selected in the repos pane.
+    fn open_branch_popup(&mut self) {
+        if self.mode != Mode::Normal {
+            return;
+        }
+        let idx = self.repos.selected();
+        self.ensure_sub_repo(idx);
+
+        let (notice, branches) = if idx > 0
+            && self
+                .overview
+                .as_ref()
+                .and_then(|ov| ov.submodules.get(idx - 1))
+                .is_some_and(|sm| !sm.initialized)
+        {
+            (
+                Some("submodule is not initialized — nothing to switch".to_string()),
+                Vec::new(),
+            )
+        } else {
+            let repo = if idx == 0 {
+                self.repo.as_ref()
+            } else {
+                self.sub_repos.get(idx - 1).and_then(|c| c.as_ref())
+            };
+            match repo {
+                Some(r) => (None, gitops::branches(r).unwrap_or_default()),
+                None => (Some("cannot open this repository".to_string()), Vec::new()),
+            }
+        };
+        let notice =
+            notice.or_else(|| (branches.is_empty()).then(|| "no branches yet".to_string()));
+
+        let len = branches.len();
+        self.branch_popup = Some(BranchPopup {
+            entry_idx: idx,
+            branches,
+            scroll: ScrollState::new(len),
+            notice,
+        });
+    }
+
+    /// Switch the popup's entry to the selected branch, then refresh
+    /// everything. A refused switch (dirty tree) keeps the popup open with
+    /// the error as its notice.
+    fn switch_selected_branch(&mut self) {
+        let Some((idx, name)) = self.branch_popup.as_ref().and_then(|bp| {
+            bp.branches
+                .get(bp.scroll.selected())
+                .map(|b| (bp.entry_idx, b.name.clone()))
+        }) else {
+            return;
+        };
+        self.ensure_sub_repo(idx);
+        let repo = if idx == 0 {
+            self.repo.as_ref()
+        } else {
+            self.sub_repos.get(idx - 1).and_then(|c| c.as_ref())
+        };
+        let Some(repo) = repo else {
+            return;
+        };
+        match gitops::switch_branch(repo, &name) {
+            Ok(()) => {
+                self.branch_popup = None;
+                self.refresh();
+            }
+            Err(e) => {
+                if let Some(bp) = self.branch_popup.as_mut() {
+                    bp.notice = Some(format!("{e:#}"));
+                }
+            }
+        }
     }
 
     // ---- navigation -----------------------------------------------------
@@ -543,11 +686,33 @@ impl App {
 
     // ---- history loading ------------------------------------------------
 
+    /// Discover and cache the repository of entry `idx` (no-op for the
+    /// main repository and for uninitialized submodules).
+    fn ensure_sub_repo(&mut self, idx: usize) {
+        if idx == 0 {
+            return;
+        }
+        let Some(cache) = self.sub_repos.get_mut(idx - 1) else {
+            return;
+        };
+        if cache.is_some() {
+            return;
+        }
+        let workdir = self
+            .overview
+            .as_ref()
+            .and_then(|ov| ov.submodules.get(idx - 1))
+            .and_then(|sm| sm.workdir.clone());
+        // discover() resolves the submodule's `.git` file/link the same way
+        // overview() decided it is initialized.
+        *cache = workdir.and_then(|wd| gitx::discover(&wd).ok().flatten());
+    }
+
     /// Load the history of entry `idx` (once); cheaper entries (submodules)
     /// are opened lazily and cached in `sub_repos`.
     fn ensure_entry_loaded(&mut self, idx: usize) {
+        self.ensure_sub_repo(idx);
         let App {
-            overview,
             repo,
             sub_repos,
             entries,
@@ -563,19 +728,8 @@ impl App {
 
         let entry_repo: Option<&Repository> = if idx == 0 {
             repo.as_ref()
-        } else if let Some(cache) = sub_repos.get_mut(idx - 1) {
-            if cache.is_none() {
-                let workdir = overview
-                    .as_ref()
-                    .and_then(|ov| ov.submodules.get(idx - 1))
-                    .and_then(|sm| sm.workdir.clone());
-                // discover() resolves the submodule's `.git` file/link the
-                // same way overview() decided it is initialized.
-                *cache = workdir.and_then(|wd| gitx::discover(&wd).ok().flatten());
-            }
-            cache.as_ref()
         } else {
-            None
+            sub_repos.get(idx - 1).and_then(|c| c.as_ref())
         };
 
         if let Some(r) = entry_repo {
@@ -688,6 +842,7 @@ mod tests {
     use super::*;
     use crate::fixture::{self, BASE_TIME, SubSpec, TempDir};
     use crossterm::event::MouseButton;
+    use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1060,5 +1215,243 @@ mod tests {
             time: git2::Time::new(BASE_TIME + 3600, 60),
         };
         assert_eq!(info.time_str(), "2023-11-15 00:13");
+    }
+
+    // ---- step 6: branch switcher -----------------------------------------
+
+    /// Super + one submodule, where the main repo also has a `feature`
+    /// branch and the submodule has an `old` branch at its first commit.
+    fn branchy_app() -> (App, TempDir) {
+        let temp = TempDir::new("app-branch").unwrap();
+        let sup = fixture::make_super(
+            &temp.path().join("super"),
+            &[SubSpec {
+                name: "subA",
+                msgs: &["a1", "a2"],
+                recorded: None,
+                drop_workdir: false,
+            }],
+        )
+        .unwrap();
+        {
+            let head = sup.repo.head().unwrap().peel_to_commit().unwrap();
+            sup.repo.branch("feature", &head, false).unwrap();
+        }
+
+        let sub = crate::gitx::discover(&temp.path().join("super/subA"))
+            .unwrap()
+            .unwrap();
+        let a1 = sup.sub_oids["subA"][0];
+        let c1 = sub.find_commit(a1).unwrap();
+        sub.branch("old", &c1, false).unwrap();
+
+        let ov = crate::gitx::overview(&sup.repo).unwrap();
+        (App::normal(ov, sup.repo), temp)
+    }
+
+    #[test]
+    fn branch_popup_lists_local_branches() {
+        let (mut app, _t) = branchy_app();
+        assert!(app.branch_popup.is_none());
+
+        app.handle_key(key(KeyCode::Char('b')));
+        let bp = app.branch_popup.as_ref().expect("popup opens on b");
+        assert_eq!(bp.entry_idx, 0);
+        assert_eq!(
+            bp.branches
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["feature", "main"],
+            "alphabetical"
+        );
+        assert!(bp.branches[1].is_head, "main is current");
+        assert!(!bp.branches[0].is_head);
+        assert_eq!(bp.scroll.selected(), 0);
+    }
+
+    #[test]
+    fn branch_switch_updates_state_and_closes_popup() {
+        let (mut app, _t) = branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Enter)); // switch to `feature` (row 0)
+
+        assert!(app.branch_popup.is_none(), "popup closes on success");
+        let ov = app.overview.as_ref().unwrap();
+        assert_eq!(ov.head, crate::gitx::HeadInfo::Branch("feature".into()));
+        assert!(
+            app.entries[0].loaded,
+            "selected entry reloads after refresh"
+        );
+        // History still shows every commit (HEAD + branches).
+        assert_eq!(app.entries[0].log.len(), 2);
+    }
+
+    #[test]
+    fn dirty_tree_refusal_keeps_popup_with_error() {
+        // Branches at *different trees* with a locally-modified tracked
+        // file: switching would overwrite it, so it must be refused. (A
+        // branch at the same commit switches fine even when dirty — git
+        // behaves the same — so the fixture needs differing trees.)
+        let temp = TempDir::new("app-branch-dirty").unwrap();
+        let root = temp.path().join("r");
+        let repo = fixture::init_repo(&root, "main").unwrap();
+        let oid1 = fixture::commit_file(&repo, "f.txt", "one\n", "c1", BASE_TIME).unwrap();
+        {
+            let c1 = repo.find_commit(oid1).unwrap();
+            repo.branch("feature", &c1, false).unwrap();
+        }
+        fixture::commit_file(&repo, "f.txt", "two\n", "c2", BASE_TIME + 60).unwrap();
+        fs::write(root.join("f.txt"), "local\n").unwrap();
+
+        let ov = crate::gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Enter)); // row 0 = feature → refused
+
+        let bp = app.branch_popup.as_ref().expect("popup stays open");
+        let notice = bp.notice.as_deref().expect("error shown");
+        assert!(notice.contains("would be overwritten"), "got: {notice}");
+        assert_eq!(
+            app.overview.as_ref().unwrap().head,
+            crate::gitx::HeadInfo::Branch("main".into()),
+            "HEAD unchanged"
+        );
+
+        // Once the tree is clean again, the same switch succeeds.
+        fs::write(root.join("f.txt"), "two\n").unwrap();
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.branch_popup.is_none());
+        assert_eq!(
+            app.overview.as_ref().unwrap().head,
+            crate::gitx::HeadInfo::Branch("feature".into())
+        );
+        assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), "one\n");
+    }
+
+    #[test]
+    fn esc_closes_branch_popup_without_switching() {
+        let (mut app, _t) = branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.branch_popup.is_none());
+        assert_eq!(
+            app.overview.as_ref().unwrap().head,
+            crate::gitx::HeadInfo::Branch("main".into())
+        );
+    }
+
+    #[test]
+    fn branch_popup_on_submodule_switches_its_branch_only() {
+        let (mut app, temp) = branchy_app();
+        let a1 = {
+            // stash the oids we care about before moving the app
+            let sub = crate::gitx::discover(&temp.path().join("super/subA"))
+                .unwrap()
+                .unwrap();
+            sub.head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .parent(0)
+                .unwrap()
+                .id()
+        };
+
+        app.handle_key(key(KeyCode::Down)); // select subA
+        app.handle_key(key(KeyCode::Char('b')));
+        let bp = app.branch_popup.as_ref().expect("popup opens");
+        assert_eq!(bp.entry_idx, 1);
+        assert_eq!(
+            bp.branches
+                .iter()
+                .map(|b| b.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["main", "old"]
+        );
+
+        app.handle_key(key(KeyCode::Down)); // → old
+        app.handle_key(key(KeyCode::Enter));
+
+        assert!(app.branch_popup.is_none());
+        let ov = app.overview.as_ref().unwrap();
+        let sm = &ov.submodules[0];
+        assert_eq!(
+            sm.head.as_ref().unwrap(),
+            &crate::gitx::HeadInfo::Branch("old".into()),
+            "submodule switched"
+        );
+        assert_eq!(sm.workdir_oid, Some(a1), "submodule workdir at a1");
+        assert_eq!(
+            sm.recorded_oid, sm.index_oid,
+            "the main repo's recorded pointer is untouched"
+        );
+        assert_ne!(sm.recorded_oid, Some(a1));
+        assert!(ov.dirty, "drift makes the superproject dirty");
+    }
+
+    #[test]
+    fn branch_popup_on_uninitialized_submodule_shows_notice() {
+        let (mut app, _t) = normal_app();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down)); // subC (not initialized)
+        app.handle_key(key(KeyCode::Char('b')));
+
+        let bp = app.branch_popup.as_ref().expect("popup opens");
+        assert!(bp.branches.is_empty());
+        let notice = bp.notice.as_deref().expect("notice set");
+        assert!(notice.contains("not initialized"), "got: {notice}");
+
+        // Enter does nothing (nothing to switch to); Esc closes.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.branch_popup.is_some());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.branch_popup.is_none());
+    }
+
+    #[test]
+    fn pick_survives_branch_switch() {
+        let (mut app, _t) = branchy_app();
+        // Pick the older commit on the main repo.
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        let pick = app.entries[0].pick.expect("pick set");
+
+        app.handle_key(key(KeyCode::Tab)); // back to repos
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Enter)); // switch to feature
+
+        assert_eq!(app.entries[0].pick, Some(pick), "pick survives the switch");
+    }
+
+    #[test]
+    fn wheel_and_click_work_in_branch_popup() {
+        let (mut app, _t) = branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
+        assert_eq!(
+            app.branch_popup.as_ref().unwrap().scroll.selected(),
+            1,
+            "wheel moves the popup selection"
+        );
+
+        app.hit_zones = vec![(Rect::new(10, 10, 20, 1), Hit::BranchRow(0))];
+        app.handle_mouse(click(15, 10));
+        assert!(
+            app.branch_popup.is_none(),
+            "click on a row switches and closes"
+        );
+        assert_eq!(
+            app.overview.as_ref().unwrap().head,
+            crate::gitx::HeadInfo::Branch("feature".into())
+        );
+
+        // A click outside any row just closes the popup.
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_mouse(click(70, 2));
+        assert!(app.branch_popup.is_none());
     }
 }
