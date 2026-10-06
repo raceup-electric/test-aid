@@ -15,7 +15,7 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use crate::app::{self, App, Entry, Focus, Hit, Mode, Popup, SaveStage};
+use crate::app::{self, App, Entry, Focus, Hit, Mode, Popup, SaveStage, View};
 use crate::gitx::HeadInfo;
 
 // The same colors carry the same meaning in every pane and popup.
@@ -119,16 +119,31 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
 /// + commit browser); a single full-width commit browser otherwise.
 fn draw_normal(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    let footer = footer_lines(app, area.width as usize);
+    let footer_height = (footer.len() as u16).min(area.height.saturating_sub(4));
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
         Constraint::Length(1),
+        Constraint::Length(footer_height),
     ])
     .split(area);
     draw_header(f, app, rows[0]);
-    draw_footer(f, app, rows[2]);
+    draw_footer(f, app, rows[3]);
+    let status = app.shortcut_hint().unwrap_or_else(|| {
+        app.form
+            .as_ref()
+            .map(|e| e.notice.clone())
+            .unwrap_or_else(|| app.status.clone())
+    });
+    f.render_widget(
+        Paragraph::new(ellipsize(&status, rows[2].width as usize)).fg(CURRENT),
+        rows[2],
+    );
 
-    if app.has_submodules() {
+    if app.view == View::Configurations {
+        draw_configs(f, app, rows[1]);
+    } else if app.has_submodules() {
         let panes = Layout::horizontal([Constraint::Max(34), Constraint::Min(24)]).split(rows[1]);
         draw_repos_pane(f, app, panes[0]);
         draw_commits_pane(f, app, panes[1]);
@@ -137,7 +152,13 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
     }
 
     if app.popup == Some(Popup::Help) {
-        draw_help(f, area);
+        draw_help(f, app, area);
+    }
+    if app.popup == Some(Popup::Network) {
+        draw_network_report(f, app, area);
+    }
+    if app.popup == Some(Popup::PullConfirm) {
+        draw_pull_confirmation(f, app, area);
     }
     if app.branch_popup.is_some() {
         draw_branch_popup(f, app);
@@ -152,18 +173,23 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let head_text = format!("· {}", ov.head.describe());
+    let title = format!(
+        " taid · {}",
+        if app.view == View::Repositories {
+            "Repositories"
+        } else {
+            "Configurations"
+        }
+    );
     let dirty_text = if ov.dirty { "  ● dirty" } else { "" };
     let path_width = (area.width as usize).saturating_sub(
-        UnicodeWidthStr::width(" taid")
+        UnicodeWidthStr::width(title.as_str())
             + UnicodeWidthStr::width(head_text.as_str())
             + UnicodeWidthStr::width(dirty_text)
             + 2,
     );
     let mut spans = vec![
-        Span::styled(
-            " taid",
-            Style::new().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled(title, Style::new().fg(ACCENT).add_modifier(Modifier::BOLD)),
         Span::raw(format!(
             " {} ",
             ellipsize(&ov.root.display().to_string(), path_width)
@@ -181,25 +207,463 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let text = if app.save_popup.is_some() {
-        " Enter apply · Esc cancel "
+    f.render_widget(
+        Paragraph::new(footer_lines(app, area.width as usize).join("\n")).dim(),
+        area,
+    );
+}
+
+fn footer_lines(app: &App, width: usize) -> Vec<String> {
+    let global = "Views: Ctrl+R,R repositories · Ctrl+C,C configs · Ctrl+P,P confirm pull";
+    let groups: Vec<String> = if app.popup == Some(Popup::PullConfirm) {
+        vec![
+            "Enter/y pull all · Esc/q/n cancel · click Pull/Cancel · Ctrl+Q quit".into(),
+            global.into(),
+        ]
+    } else if app.save_popup.is_some() {
+        vec![
+            if matches!(app.save_popup, Some(SaveStage::Confirm(_))) {
+                "Enter apply · Esc/q cancel"
+            } else {
+                "Enter/Esc/q close results"
+            }
+            .into(),
+            "Ctrl+Q quit".into(),
+            global.into(),
+        ]
     } else if app.branch_popup.is_some() {
-        " ↑↓ select · Enter switch · Esc close "
+        vec![
+            "↑↓/kj select · PgUp/PgDn page · Home/End ends · Enter switch · Esc/q close".into(),
+            "Ctrl+Q quit".into(),
+            global.into(),
+        ]
     } else if app.popup.is_some() {
-        " Esc — close "
+        vec![
+            "↑↓/kj scroll · Enter/Esc/q close · Ctrl+Q quit".into(),
+            global.into(),
+        ]
+    } else if let Some(form) = &app.form {
+        let mut lines = if form.editing.is_some() {
+            vec![
+                "Value: type/paste replaces · ←→/Home/End cursor · Ctrl+U clear".into(),
+                "Enter accept value · Esc cancel value · Backspace/Delete remove".into(),
+            ]
+        } else if form.filtering {
+            vec![format!(
+                "Find: /{}▌ · Enter keep · Esc clear · Ctrl+U clear",
+                form.filter
+            )]
+        } else {
+            vec![
+                "↑↓/kj choose · PgUp/PgDn page · Home/End ends · / find parameter".into(),
+                "Enter/Space edit or toggle · r reset value · click edit · wheel scroll".into(),
+            ]
+        };
+        lines.push("Ctrl+S save · Esc close · Ctrl+D discard & close · Ctrl+Q quit".into());
+        lines.push(global.into());
+        lines
     } else if app.filter_editing {
-        let prompt = format!(" /{}▌  Enter keep · Esc clear · Ctrl+U clear ", app.filter);
-        f.render_widget(
-            Paragraph::new(ellipsize(&prompt, area.width as usize)).fg(ACCENT),
-            area,
-        );
-        return;
-    } else if app.has_submodules() {
-        " ↑↓ move · Tab panes · Enter pick · / filter · b branch · s save · ? help · q quit "
+        vec![
+            format!(
+                "/{}▌ · Enter keep · Esc clear · Ctrl+U clear · Ctrl+Q quit",
+                app.filter
+            ),
+            global.into(),
+        ]
     } else {
-        " ↑↓ move · Enter pick · / filter · b branch · s save · ? help · q quit "
+        vec![
+            global.into(),
+            "Move: ↑↓/kj · PgUp/PgDn · Home/End · Tab/Shift+Tab/←→ panes".into(),
+            if app.view == View::Configurations {
+                "Enter edit config · r refresh · n remote results · ? help · q/Esc/Ctrl+Q quit"
+                    .into()
+            } else {
+                "Enter pick · / filter · b branch · s save · r refresh".into()
+            },
+            if app.view == View::Repositories {
+                "n remote results · ? help · q/Esc/Ctrl+Q quit".into()
+            } else {
+                "Mouse: click select/edit · wheel scroll".into()
+            },
+            if app.view == View::Repositories {
+                "Mouse: click select · wheel scroll".into()
+            } else {
+                String::new()
+            },
+        ]
     };
-    f.render_widget(Paragraph::new(text).dim(), area);
+    let mut lines = Vec::new();
+    for group in groups.iter().filter(|s| !s.is_empty()) {
+        let mut line = String::new();
+        for word in group.split_whitespace() {
+            if !line.is_empty()
+                && UnicodeWidthStr::width(line.as_str()) + UnicodeWidthStr::width(word) + 1 > width
+            {
+                lines.push(line);
+                line = String::new();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn draw_configs(f: &mut Frame, app: &mut App, area: Rect) {
+    if app.form.is_some() {
+        draw_form(f, app, area);
+        return;
+    }
+    let panes =
+        Layout::horizontal([Constraint::Percentage(35), Constraint::Percentage(65)]).split(area);
+    let block = Block::bordered()
+        .title(" Modules with config ")
+        .border_style(pane_border(app.focus == Focus::Repos));
+    let inner = block.inner(panes[0]);
+    app.pane_heights.repos = inner.height as usize;
+    app.config_repos.ensure_visible(inner.height as usize);
+    f.render_widget(block, panes[0]);
+    let (offset, count) = app.config_repos.visible(inner.height as usize);
+    for row in 0..count {
+        let idx = offset + row;
+        let module = &app.config_modules[idx];
+        let badge = app
+            .entries
+            .get(module.entry_idx)
+            .and_then(|e| e.updates.as_ref())
+            .is_some_and(|u| u.newer > 0);
+        let name_width = (inner.width as usize).saturating_sub(if badge { 6 } else { 0 });
+        let mut spans = vec![Span::raw(ellipsize(&module.name, name_width))];
+        if badge {
+            spans.push(Span::styled(" [new]", Style::new().fg(CURRENT)));
+        }
+        let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+        let style = if idx == app.config_repos.selected() {
+            selected_style(app.focus == Focus::Repos)
+        } else {
+            Style::new()
+        };
+        f.render_widget(Paragraph::new(Line::from(spans).style(style)), rect);
+        app.hit_zones.push((rect, Hit::ConfigModule(idx)));
+    }
+    let block = Block::bordered()
+        .title(" Config files · Enter to edit ")
+        .border_style(pane_border(app.focus == Focus::Commits));
+    let inner = block.inner(panes[1]);
+    app.pane_heights.commits = inner.height as usize;
+    app.config_files.ensure_visible(inner.height as usize);
+    f.render_widget(block, panes[1]);
+    if let Some(module) = app.config_modules.get(app.config_repos.selected()) {
+        let (offset, count) = app.config_files.visible(inner.height as usize);
+        for row in 0..count {
+            let idx = offset + row;
+            let label = module.files[idx]
+                .strip_prefix(&module.root)
+                .unwrap_or(&module.files[idx])
+                .display()
+                .to_string();
+            let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+            let style = if idx == app.config_files.selected() {
+                selected_style(app.focus == Focus::Commits)
+            } else {
+                Style::new()
+            };
+            f.render_widget(
+                Paragraph::new(ellipsize(&label, inner.width as usize)).style(style),
+                rect,
+            );
+            app.hit_zones.push((rect, Hit::ConfigFile(idx)));
+        }
+    } else {
+        f.render_widget(
+            Paragraph::new("No initialized submodules contain config files.")
+                .dim()
+                .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
+}
+
+fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
+    let form = app.form.as_mut().unwrap();
+    let relative = form.path.strip_prefix(&app.context).unwrap_or(&form.path);
+    let title = format!(
+        " Parameters · {}{} ",
+        relative.display(),
+        if form.dirty() { " *" } else { "" }
+    );
+    let block = Block::bordered()
+        .title(ellipsize(&title, area.width.saturating_sub(2) as usize))
+        .border_style(pane_border(true));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width < 8 {
+        return;
+    }
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(4),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    let group = form.selected().map(|p| p.group.as_str()).unwrap_or("");
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "{} parameters · {} unsaved · existing values only",
+                form.parameters.len(),
+                form.changed_count()
+            ))
+            .fg(ACCENT),
+            Line::from(ellipsize(group, rows[0].width as usize)).dim(),
+        ]),
+        rows[0],
+    );
+    let list = rows[1];
+    let name_width = (list.width as usize * 55 / 100).saturating_sub(2);
+    let type_width = 10.min((list.width as usize).saturating_sub(name_width + 2));
+    let value_width = (list.width as usize).saturating_sub(name_width + type_width + 2);
+    let header = format!("  {:<name_width$}{:<type_width$}Value", "Parameter", "Type");
+    f.render_widget(
+        Paragraph::new(header).dim(),
+        Rect::new(list.x, list.y, list.width, list.height.min(1)),
+    );
+    let height = list.height.saturating_sub(1) as usize;
+    app.pane_heights.commits = height;
+    form.scroll.ensure_visible(height);
+    let (offset, count) = form.scroll.visible(height);
+    for row in 0..count {
+        let idx = offset + row;
+        let p = &form.parameters[form.visible[idx]];
+        let name = p
+            .name
+            .split_once(".ros__parameters.")
+            .map(|(_, name)| name)
+            .unwrap_or(&p.name);
+        let name = ellipsize(name, name_width);
+        let padding = name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+        let value = if p.kind == crate::config::Kind::Boolean {
+            format!(
+                "[{}] {}",
+                if p.value == "true" { "x" } else { " " },
+                p.value
+            )
+        } else {
+            p.value.replace('\n', "\\n")
+        };
+        let mut spans = vec![
+            Span::styled(
+                if p.changed() { "* " } else { "  " },
+                Style::new().fg(PICKED),
+            ),
+            Span::raw(format!("{name}{}", " ".repeat(padding))),
+            Span::styled(
+                format!("{:<type_width$}", ellipsize(p.kind.label(), type_width)),
+                Style::new().fg(MUTED),
+            ),
+            Span::styled(
+                ellipsize(&value, value_width),
+                Style::new().fg(if p.readonly.is_some() {
+                    MUTED
+                } else if p.changed() {
+                    PICKED
+                } else {
+                    CURRENT
+                }),
+            ),
+        ];
+        if idx == form.scroll.selected() {
+            for span in &mut spans {
+                span.style = span.style.patch(selected_style(true));
+            }
+        }
+        let rect = Rect::new(list.x, list.y + row as u16 + 1, list.width, 1);
+        f.render_widget(Paragraph::new(Line::from(spans)), rect);
+        app.hit_zones.push((rect, Hit::ParameterRow(idx)));
+    }
+    if let Some(p) = form.selected() {
+        let help = p.readonly.as_deref().unwrap_or(&p.description);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(ellipsize(&p.name, rows[2].width as usize)).fg(ACCENT),
+                Line::from(help.to_owned()).dim(),
+            ])
+            .wrap(Wrap { trim: false }),
+            rows[2],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new("No matching parameters. Press / to change the search.").dim(),
+            rows[2],
+        );
+    }
+    let mut x = rows[3].x;
+    for (label, hit) in [
+        ("[ Save · Ctrl+S ]", Hit::ParameterSave),
+        ("[ Back · Esc ]", Hit::ParameterBack),
+    ] {
+        let width = (UnicodeWidthStr::width(label) as u16).min(rows[3].right().saturating_sub(x));
+        if width > 0 && rows[3].height > 0 {
+            let rect = Rect::new(x, rows[3].y, width, 1);
+            f.render_widget(Paragraph::new(label).style(selected_style(true)), rect);
+            app.hit_zones.push((rect, hit));
+        }
+        x = x.saturating_add(width + 2);
+    }
+    if let Some(input) = &form.editing {
+        let p = form.selected().unwrap();
+        let popup = centered_fixed(72, 10, area);
+        f.render_widget(Clear, popup);
+        let block = Block::bordered()
+            .title(format!(" {} · {} ", p.label, p.kind.label()))
+            .border_style(pane_border(true));
+        let inner = block.inner(popup);
+        f.render_widget(block, popup);
+        let rows = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+        f.render_widget(
+            Paragraph::new(ellipsize(&p.group, rows[0].width as usize)).dim(),
+            rows[0],
+        );
+        f.render_widget(
+            Paragraph::new(p.description.clone()).wrap(Wrap { trim: false }),
+            rows[1],
+        );
+        let cursor_width = |start: usize| {
+            UnicodeWidthStr::width(
+                input
+                    .text
+                    .chars()
+                    .skip(start)
+                    .take(input.cursor - start)
+                    .collect::<String>()
+                    .as_str(),
+            )
+        };
+        let mut start = 0;
+        while start < input.cursor && cursor_width(start) >= rows[2].width.max(1) as usize {
+            start += 1;
+        }
+        let value = input.text.chars().skip(start).collect::<String>();
+        let style = if input.replace {
+            selected_style(true)
+        } else {
+            Style::new().bg(Color::DarkGray)
+        };
+        f.render_widget(
+            Paragraph::new(take_cells(&value, rows[2].width as usize)).style(style),
+            rows[2],
+        );
+        if rows[2].width > 0 && rows[2].height > 0 {
+            f.set_cursor_position((rows[2].x + cursor_width(start) as u16, rows[2].y));
+        }
+        f.render_widget(
+            Paragraph::new(form.notice.clone())
+                .fg(CURRENT)
+                .wrap(Wrap { trim: false }),
+            rows[3],
+        );
+    }
+}
+
+fn draw_pull_confirmation(f: &mut Frame, app: &mut App, area: Rect) {
+    let popup = centered_fixed(68, 14, area);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Confirm pull ")
+        .border_style(pane_border(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    app.hit_zones.push((popup, Hit::PullPopup));
+    let initialized = app
+        .overview
+        .as_ref()
+        .map(|ov| {
+            ov.submodules
+                .iter()
+                .filter(|sm| sm.workdir.is_some())
+                .count()
+        })
+        .unwrap_or(0);
+    let rows = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "Pull the main repository and {initialized} initialized submodules?"
+            ))
+            .fg(ACCENT),
+            Line::from(""),
+            Line::from("This fetches remotes and fast-forwards each current branch."),
+            Line::from("Dirty, detached or diverged repositories are not overwritten."),
+            Line::from("No merges, commits or staged submodule pointers are created."),
+            Line::from(""),
+            Line::from("Results are reported separately for every repository.").dim(),
+        ])
+        .wrap(Wrap { trim: false }),
+        rows[0],
+    );
+    f.render_widget(
+        Paragraph::new("Enter/y pull all · Esc/q/n cancel").dim(),
+        rows[1],
+    );
+    let buttons =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[2]);
+    draw_button(
+        f,
+        app,
+        buttons[0],
+        "[ Pull ]",
+        Hit::PullConfirm,
+        ButtonPos::Center,
+    );
+    draw_button(
+        f,
+        app,
+        buttons[1],
+        "[ Cancel ]",
+        Hit::PullCancel,
+        ButtonPos::Center,
+    );
+}
+
+fn draw_network_report(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(90, 85, area);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Remote results · ↑↓ scroll ")
+        .border_style(pane_border(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let mut lines = Vec::new();
+    for (name, result) in app.network_results.iter().skip(app.report_scroll) {
+        let (message, color) = match result {
+            Ok(text) => (text, PICKED),
+            Err(text) => (text, WARNING),
+        };
+        lines.push(Line::from(name.clone()).fg(ACCENT));
+        lines.push(Line::from(message.clone()).fg(color));
+        lines.push(Line::from(""));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("No remote results yet."));
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
 fn pane_border(focused: bool) -> Style {
@@ -240,6 +704,14 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
                 spans.push(dirty_span(m.dirty));
+                if app
+                    .entries
+                    .get(idx)
+                    .and_then(|e| e.updates.as_ref())
+                    .is_some_and(|u| u.newer > 0)
+                {
+                    spans.push(Span::styled(" [new]", Style::new().fg(CURRENT)));
+                }
                 let name_width =
                     (inner.width as usize).saturating_sub(Line::from(spans.clone()).width());
                 spans.insert(
@@ -256,15 +728,14 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
                 if !sm.initialized {
                     spans.push(Span::styled("not initialized", Style::new().fg(WARNING)));
                 } else {
-                    match sm.recorded_oid {
-                        Some(r) => spans.push(Span::styled(short_oid(r), Style::new().fg(CURRENT))),
-                        None => spans.push(Span::styled("?", Style::new().fg(MUTED))),
+                    if let Some(head) = &sm.head {
+                        spans.push(Span::styled(
+                            ellipsize(&head_short(head), 8),
+                            Style::new().fg(MUTED),
+                        ));
                     }
                     if sm.recorded_oid != sm.workdir_oid {
-                        if let Some(w) = sm.workdir_oid {
-                            spans.push(dim(" ≠"));
-                            spans.push(Span::styled(short_oid(w), Style::new().fg(ACCENT)));
-                        }
+                        spans.push(Span::styled(" ≠", Style::new().fg(ACCENT)));
                     }
                 }
                 if pick.is_some() {
@@ -276,9 +747,23 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
                 if sm.dirty == Some(true) {
                     spans.push(dirty_span(true));
                 }
+                if app
+                    .entries
+                    .get(idx)
+                    .and_then(|e| e.updates.as_ref())
+                    .is_some_and(|u| u.newer > 0)
+                {
+                    spans.push(Span::styled(" [new]", Style::new().fg(CURRENT)));
+                }
                 let name_width =
                     (inner.width as usize).saturating_sub(Line::from(spans.clone()).width());
-                spans.insert(0, Span::raw(ellipsize(&sm.name, name_width)));
+                spans.insert(
+                    0,
+                    Span::raw(ellipsize(
+                        &root_name(std::path::Path::new(&sm.path)),
+                        name_width,
+                    )),
+                );
                 Line::from(spans)
             }
             None => continue,
@@ -453,7 +938,7 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
     };
     let idx = app.repos.selected();
 
-    let first: Vec<Span<'static>> = match app::entry_at(ov, idx) {
+    let mut first: Vec<Span<'static>> = match app::entry_at(ov, idx) {
         Some(Entry::Main(m)) => vec![
             Span::styled(
                 root_name(&m.root),
@@ -506,6 +991,17 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
         ],
         None => Vec::new(),
     };
+    if let Some(update) = app
+        .entries
+        .get(idx)
+        .and_then(|e| e.updates.as_ref())
+        .filter(|u| u.newer > 0)
+    {
+        first.push(Span::styled(
+            format!(" [new] {} commit(s) on {}", update.newer, update.branch),
+            Style::new().fg(CURRENT),
+        ));
+    }
     vec![Line::from(first), pick_line(app, idx)]
 }
 
@@ -956,16 +1452,18 @@ fn draw_button(
     rect
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let popup = centered_rect(70, 90, area);
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+    let popup = centered_rect(95, 95, area);
     f.render_widget(Clear, popup);
     let block = Block::bordered()
-        .title(" Help ")
+        .title(" Help · ↑↓ scroll ")
         .border_style(Style::new().fg(ACCENT));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
     let keys: &[(&str, &str)] = &[
+        ("Ctrl+R,R / Ctrl+C,C", "repositories / configurations"),
+        ("Ctrl+P,P", "confirm fetch and fast-forward all repos"),
         ("↑ ↓ / k j", "move selection"),
         ("PgUp PgDn / Home End", "scroll by page / first-last"),
         ("Tab / Shift+Tab", "switch pane (repos ↔ commits)"),
@@ -973,10 +1471,14 @@ fn draw_help(f: &mut Frame, area: Rect) {
         ("b", "switch branch of repo/submodule"),
         ("s", "save: apply picked commits"),
         ("r", "refresh repository state"),
+        ("n", "remote results (↑↓ to scroll)"),
         ("/", "filter commits by title or SHA"),
         ("click / wheel", "select rows, focus panes, scroll"),
         ("?", "toggle this help"),
         ("q / Esc", "quit (or close a popup)"),
+        ("Ctrl+Q", "quit (protects unsaved edits)"),
+        ("YAML forms", "Enter value/toggle; / find; r reset"),
+        ("Form save/close", "Ctrl+S save; Esc close; Ctrl+D discard"),
     ];
     let mut lines = vec![
         Line::from("Keys").add_modifier(Modifier::BOLD),
@@ -993,9 +1495,17 @@ fn draw_help(f: &mut Frame, area: Rect) {
     lines.push(Line::from("  ○ where the submodule's working directory is"));
     lines.push(Line::from("  ✓ your pick"));
     lines.push(Line::from(
-        "  taid is strictly local: nothing is fetched or pushed.".dim(),
+        "  [new] commits missing locally on selected branch",
     ));
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.push(Line::from(
+        "  Badges use stored refs; confirmed pulls refresh remotes.".dim(),
+    ));
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((app.report_scroll as u16, 0)),
+        inner,
+    );
 }
 
 /// Clip by terminal cells, keeping Unicode grapheme clusters intact.
@@ -1126,7 +1636,9 @@ mod tests {
     use crate::app::{App, ApplyOutcome, Focus, Hit, Popup, SaveChange, SaveStage};
     use crate::fixture::{self, SubSpec, TempDir};
     use crate::gitx;
-    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::Path;
@@ -1318,13 +1830,123 @@ mod tests {
 
         let buf = render(&mut app, 80, 24);
         let text = screen_text(&buf);
-        assert!(!text.contains("Repos"), "no repo pane: {text}");
+        assert!(
+            !app.hit_zones.iter().any(|(_, hit)| *hit == Hit::PaneRepos),
+            "no repo pane: {text}"
+        );
         assert!(text.contains("History — r (1)"), "history title: {text}");
         assert!(text.contains("c1"));
 
         // Small terminals stay safe in single-pane mode too.
         render(&mut app, 12, 5);
         render(&mut app, 8, 3);
+    }
+
+    #[test]
+    fn config_view_mouse_form_validation_and_wrapped_shortcuts_render() {
+        let (mut app, temp) = make_normal_app();
+        let path = temp.path().join("super/subA/controller/config/gains.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# controller\ngain: 1\n").unwrap();
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('c')));
+        let text = screen_text(&render(&mut app, 80, 24));
+        assert!(text.contains("Configurations"));
+        assert!(text.contains("controller/config/gains.yaml"));
+        assert!(!text.contains("subC"));
+        for shortcut in [
+            "Ctrl+R,R",
+            "Ctrl+C,C",
+            "Ctrl+P,P",
+            "PgUp/PgDn",
+            "Home/End",
+            "r refresh",
+            "? help",
+            "Ctrl+Q",
+        ] {
+            assert!(text.contains(shortcut), "missing {shortcut}: {text}");
+        }
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::ConfigFile(0)).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(rect.x + 1, rect.y));
+        assert_eq!(
+            app.form.as_ref().unwrap().path,
+            path.canonicalize().unwrap()
+        );
+        let text = screen_text(&render(&mut app, 80, 24));
+        assert!(text.contains("gain") && text.contains("integer"));
+        assert!(text.contains("Parameters"));
+        assert!(!text.contains("gain: 1"), "the form never exposes raw YAML");
+        assert!(text.contains("Ctrl+S save"));
+        assert!(text.contains("Ctrl+D discard"));
+        for (width, height) in [(1, 1), (10, 4), (20, 6), (50, 20)] {
+            render(&mut app, width, height);
+        }
+        render(&mut app, 80, 24);
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::ParameterRow(0)).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(rect.x + 1, rect.y));
+        app.handle_paste("invalid number");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.form.as_ref().unwrap().editing.is_some());
+        let text = screen_text(&render(&mut app, 80, 24));
+        assert!(text.contains("whole number"), "{text}");
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('3')));
+        render(&mut app, 80, 24);
+        let save = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::ParameterSave).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(save.x + 1, save.y));
+        assert_eq!(
+            std::fs::read_to_string(app.form.as_ref().unwrap().path.clone()).unwrap(),
+            "# controller\ngain: 3\n"
+        );
+    }
+
+    #[test]
+    fn new_badge_is_yellow_when_checkout_is_behind_selected_branch() {
+        let (mut app, _temp) = make_normal_app();
+        let sub = app
+            .repo
+            .as_ref()
+            .unwrap()
+            .find_submodule("subA")
+            .unwrap()
+            .open()
+            .unwrap();
+        let old = sub
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        crate::gitops::checkout_oid(&sub, old).unwrap();
+        app.refresh();
+        app.select_repo(1);
+        let buffer = render(&mut app, 100, 30);
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::RepoRow(1)).then_some(*rect))
+            .unwrap();
+        let row: String = (rect.x..rect.x + rect.width)
+            .map(|x| buffer[(x, rect.y)].symbol())
+            .collect();
+        assert!(row.contains("[new]"), "{row}");
+        let position = row.find("[new]").unwrap();
+        let x = rect.x + UnicodeWidthStr::width(&row[..position]) as u16;
+        assert_eq!(buffer[(x, rect.y)].fg, CURRENT);
     }
 
     #[test]
@@ -1383,10 +2005,45 @@ mod tests {
 
         assert!(text.contains("move selection"));
         assert!(text.contains("pick / un-pick"));
-        assert!(text.contains("strictly local"));
+        assert!(text.contains("Ctrl+P,P"));
 
         app.handle_mouse(click(40, 12));
         assert_eq!(app.popup, None);
+    }
+
+    #[test]
+    fn pull_confirmation_renders_and_mouse_cancel_does_not_start_network() {
+        let (mut app, _temp) = make_normal_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('p')));
+        let text = screen_text(&render(&mut app, 80, 24));
+        assert!(text.contains("Confirm pull"));
+        assert!(text.contains("fast-forwards"));
+        assert!(text.contains("[ Pull ]") && text.contains("[ Cancel ]"));
+        assert!(text.contains("Enter/y pull all"));
+        assert!(
+            app.hit_zones
+                .iter()
+                .any(|(_, hit)| *hit == Hit::PullConfirm)
+        );
+        let cancel = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::PullCancel).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(0, 0));
+        assert_eq!(
+            app.popup,
+            Some(Popup::PullConfirm),
+            "outside clicks cannot pull"
+        );
+        app.handle_mouse(click(cancel.x, cancel.y));
+        assert_eq!(app.popup, None);
+        assert!(app.network_job.is_none());
+        app.popup = Some(Popup::PullConfirm);
+        for (width, height) in [(1, 1), (8, 3), (12, 5), (30, 10)] {
+            render(&mut app, width, height);
+        }
     }
 
     #[test]

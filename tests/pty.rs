@@ -205,6 +205,29 @@ fn in_a_repo_q_quits_cleanly() -> TestResult {
 }
 
 #[test]
+fn startup_and_cancelled_pull_never_invoke_git() -> TestResult {
+    let (temp, root) = super_repo("pty-manual-pull")?;
+    let repo = git2::Repository::open(&root)?;
+    // A real local remote ensures the old startup fetch would execute Git.
+    repo.remote("origin", root.to_str().unwrap())?;
+    let trace = temp.path().join("git-trace.log");
+    let mut session = PtySession::spawn(&root, Some(("GIT_TRACE", trace.to_str().unwrap())))?;
+    session.wait_until_started()?;
+    std::thread::sleep(Duration::from_millis(250));
+    session.send("\u{10}pnq")?;
+    let (status, raw) = session.finish();
+    assert!(status.expect("cancel then q should exit").success());
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(screen.contains("Confirm pull"), "{screen}");
+    assert!(screen.contains("[ Cancel ]"), "{screen}");
+    assert!(
+        !trace.exists() || std::fs::read(&trace)?.is_empty(),
+        "startup and cancellation must not execute a Git fetch or pull"
+    );
+    Ok(())
+}
+
+#[test]
 fn outside_a_repo_shows_popup_and_ok_exits() -> TestResult {
     let temp = TempDir::new("pty-notrepo")?;
     let mut session = PtySession::spawn(temp.path(), None)?;
@@ -438,6 +461,33 @@ fn resize_redraws_and_quits_cleanly() -> TestResult {
     let status = status.expect("taid should exit after resizing");
     assert!(status.success(), "raw output: {raw:?}");
     assert!(String::from_utf8_lossy(&raw).contains("subA"));
+    Ok(())
+}
+
+#[test]
+fn config_chord_edits_and_saves_a_real_file() -> TestResult {
+    let (_temp, root) = super_repo("pty-config")?;
+    let path = root.join("subA/ros_package/config/params.yaml");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, "gain: 1\n")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Ctrl+C, C → configs; Tab/Enter → form; Enter/2/Enter → typed value;
+    // Ctrl+S → disk; Esc → files; Ctrl+R, R → repositories; q → exit.
+    session.send("\u{3}c\t\r\r2\r\u{13}\u{1b}\u{12}rq")?;
+    let (status, raw) = session.finish();
+    assert!(
+        status.expect("config workflow should exit").success(),
+        "{raw:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&path)?, "gain: 2\n");
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(screen.contains("Configurations"), "{screen}");
+    assert!(
+        screen.contains("integer"),
+        "typed parameter input: {screen}"
+    );
+    assert!(screen.contains("Ctrl+S save"), "{screen}");
     Ok(())
 }
 

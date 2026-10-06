@@ -79,6 +79,63 @@ pub fn head_info(repo: &Repository) -> Result<HeadInfo> {
     }
 }
 
+/// Branch being browsed, retained when a commit pick detaches HEAD. For a
+/// checkout opened detached, infer it only when one local branch contains HEAD.
+pub fn selected_branch(repo: &Repository, previous: Option<&str>) -> Option<String> {
+    if let Ok(HeadInfo::Branch(name)) = head_info(repo) {
+        return Some(name);
+    }
+    if let Some(name) = previous {
+        if repo.find_branch(name, git2::BranchType::Local).is_ok() {
+            return Some(name.to_owned());
+        }
+    }
+    let head = repo.head().ok()?.target()?;
+    let candidates: Vec<String> = repo
+        .branches(Some(git2::BranchType::Local))
+        .ok()?
+        .filter_map(|b| b.ok())
+        .filter(|(b, _)| {
+            b.get().target().is_some_and(|tip| {
+                tip == head || repo.graph_descendant_of(tip, head).unwrap_or(false)
+            })
+        })
+        .filter_map(|(b, _)| b.name().ok().flatten().map(str::to_owned))
+        .collect();
+    (candidates.len() == 1).then(|| candidates[0].clone())
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateInfo {
+    pub branch: String,
+    /// Commits reachable from the local branch or its fetched upstream that
+    /// are missing from the checkout. Divergence also counts as new commits.
+    pub newer: usize,
+    pub has_upstream: bool,
+}
+
+pub fn update_info(repo: &Repository, selected: Option<&str>) -> Option<UpdateInfo> {
+    let name = selected_branch(repo, selected)?;
+    let branch = repo.find_branch(&name, git2::BranchType::Local).ok()?;
+    let head = repo.head().ok()?.target()?;
+    let tip = branch.get().target()?;
+    let upstream = branch.upstream().ok().and_then(|b| b.get().target());
+    let mut walk = repo.revwalk().ok()?;
+    walk.push(tip).ok()?;
+    if let Some(upstream) = upstream {
+        walk.push(upstream).ok()?;
+    }
+    walk.hide(head).ok()?;
+    let newer = walk
+        .try_fold(0usize, |count, oid| oid.map(|_| count + 1))
+        .ok()?;
+    Some(UpdateInfo {
+        branch: name,
+        newer,
+        has_upstream: upstream.is_some(),
+    })
+}
+
 /// True when the worktree or index differs from HEAD (untracked files count).
 pub fn is_dirty(repo: &Repository) -> Result<bool> {
     let mut opts = StatusOptions::new();

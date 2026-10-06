@@ -73,14 +73,18 @@ fn run_tui() -> ExitCode {
 fn help_text() -> String {
     format!(
         "\
-{NAME} {} — manage which commits your repository records for its submodules
+{NAME} {} — manage driverless repositories and module configurations
 
 USAGE:
     taid               Launch the TUI in the current directory
     taid --version     Print version information
     taid --help        Print this help
 
-taid is strictly local: it never fetches, never pushes, never rewrites history.
+Ctrl+R,R repositories · Ctrl+C,C configurations · Ctrl+P,P pull all
+YAML forms: Enter edits a parameter; Ctrl+S saves. Quit: q / Esc / Ctrl+Q.
+No remote operations run at startup. Ctrl+P,P asks for confirmation;
+confirmed pulls are fast-forward only. System Git is required
+for remote operations. taid never pushes, creates commits, or rewrites history.
 ",
         env!("CARGO_PKG_VERSION")
     )

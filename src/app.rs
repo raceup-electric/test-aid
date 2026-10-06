@@ -6,6 +6,8 @@
 //! `event` feeds it — so it can be unit-tested without a tty.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use crossterm::event::{
@@ -16,6 +18,20 @@ use ratatui::layout::Rect;
 
 use crate::gitops::{self, BranchEntry};
 use crate::gitx::{self, CommitLog, RepoOverview, SubmoduleEntry};
+use crate::{config, network};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Repositories,
+    Configurations,
+}
+
+pub struct ConfigModule {
+    pub entry_idx: usize,
+    pub name: String,
+    pub root: PathBuf,
+    pub files: Vec<PathBuf>,
+}
 
 /// Commits materialized when an entry is first opened.
 const INITIAL_WINDOW: usize = 60;
@@ -56,6 +72,8 @@ impl Focus {
 pub enum Popup {
     /// Keymap reference.
     Help,
+    Network,
+    PullConfirm,
 }
 
 /// State of the branch-switcher popup (`b`): the entry it acts on, that
@@ -112,6 +130,14 @@ pub enum Hit {
     SaveCancel,
     SaveOk,
     OkButton,
+    ConfigModule(usize),
+    ConfigFile(usize),
+    ParameterRow(usize),
+    ParameterSave,
+    ParameterBack,
+    PullPopup,
+    PullConfirm,
+    PullCancel,
 }
 
 /// One row of the left pane: the main repository or one submodule.
@@ -256,6 +282,8 @@ pub struct EntryState {
     /// Visible row -> index in the full commit log.
     pub visible: Vec<usize>,
     pub filtered_for: String,
+    pub branch: Option<String>,
+    pub updates: Option<gitx::UpdateInfo>,
 }
 
 impl EntryState {
@@ -268,6 +296,8 @@ impl EntryState {
             loaded: false,
             visible: Vec::new(),
             filtered_for: String::new(),
+            branch: None,
+            updates: None,
         }
     }
 }
@@ -275,6 +305,17 @@ impl EntryState {
 /// The whole application state, rendered by `ui` and mutated by input.
 pub struct App {
     pub mode: Mode,
+    pub view: View,
+    pub config_modules: Vec<ConfigModule>,
+    pub config_repos: ScrollState,
+    pub config_files: ScrollState,
+    pub form: Option<config::Form>,
+    pub status: String,
+    pub network_results: Vec<(String, Result<String, String>)>,
+    pub report_scroll: usize,
+    pub network_job: Option<Receiver<network::Event>>,
+    network_operation: Option<network::Operation>,
+    shortcut: Option<(char, Instant)>,
     /// Message shown by the NotRepo/Error popup.
     pub message: String,
     /// Directory context shown in popups (cwd or repo root).
@@ -318,6 +359,17 @@ impl App {
     fn message_mode(mode: Mode, cwd: &Path, msg: impl Into<String>) -> Self {
         Self {
             mode,
+            view: View::Repositories,
+            config_modules: Vec::new(),
+            config_repos: ScrollState::new(0),
+            config_files: ScrollState::new(0),
+            form: None,
+            status: String::new(),
+            network_results: Vec::new(),
+            report_scroll: 0,
+            network_job: None,
+            network_operation: None,
+            shortcut: None,
             message: msg.into(),
             context: cwd.to_path_buf(),
             overview: None,
@@ -345,6 +397,17 @@ impl App {
         }
         let mut app = Self {
             mode: Mode::Normal,
+            view: View::Repositories,
+            config_modules: Vec::new(),
+            config_repos: ScrollState::new(0),
+            config_files: ScrollState::new(0),
+            form: None,
+            status: String::new(),
+            network_results: Vec::new(),
+            report_scroll: 0,
+            network_job: None,
+            network_operation: None,
+            shortcut: None,
             message: String::new(),
             context: overview.root.clone(),
             overview: Some(overview),
@@ -364,6 +427,7 @@ impl App {
             filter_editing: false,
         };
         app.ensure_entry_loaded(0);
+        app.refresh_updates();
         app
     }
 
@@ -410,9 +474,18 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
-        // Ctrl+C always quits, whatever is on screen.
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.should_quit = true;
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.code == KeyCode::Char('q')
+                || (self.mode != Mode::Normal && key.code == KeyCode::Char('c')))
+        {
+            self.request_quit();
+            return;
+        }
+        if self.mode == Mode::Normal && self.handle_shortcut(key) {
+            return;
+        }
+        if self.form.is_some() {
+            self.handle_form_key(key);
             return;
         }
         match self.mode {
@@ -420,16 +493,386 @@ impl App {
             Mode::Normal if self.save_popup.is_some() => self.handle_save_key(key.code),
             Mode::Normal if self.branch_popup.is_some() => self.handle_branch_key(key.code),
             Mode::Normal if self.filter_editing => self.handle_filter_key(key.code, key.modifiers),
+            Mode::Normal if self.popup == Some(Popup::PullConfirm) => match key.code {
+                KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.start_network(network::Operation::Pull);
+                }
+                KeyCode::Esc
+                | KeyCode::Char('q')
+                | KeyCode::Char('Q')
+                | KeyCode::Char('n')
+                | KeyCode::Char('N') => self.popup = None,
+                _ => {}
+            },
             Mode::Normal if self.popup.is_some() => match key.code {
                 KeyCode::Esc
                 | KeyCode::Enter
                 | KeyCode::Char('?')
                 | KeyCode::Char('q')
                 | KeyCode::Char('Q') => self.popup = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let limit = if self.popup == Some(Popup::Help) {
+                        24
+                    } else {
+                        self.network_results.len().saturating_sub(1)
+                    };
+                    self.report_scroll = (self.report_scroll + 1).min(limit);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.report_scroll = self.report_scroll.saturating_sub(1)
+                }
                 _ => {}
             },
+            Mode::Normal if self.view == View::Configurations => self.handle_config_key(key.code),
             Mode::Normal => self.handle_normal_key(key.code),
         }
+    }
+
+    fn request_quit(&mut self) {
+        if self.network_job.is_some() {
+            self.status = "Remote operation running; wait for it to finish before quitting".into();
+            if let Some(form) = &mut self.form {
+                form.notice = self.status.clone();
+            }
+        } else if let Some(form) = self.form.as_mut().filter(|e| e.dirty()) {
+            form.notice = "Unsaved changes: Ctrl+S save or Ctrl+D discard and close".into();
+        } else {
+            self.should_quit = true;
+        }
+    }
+
+    fn handle_shortcut(&mut self, key: KeyEvent) -> bool {
+        if let Some((prefix, started)) = self.shortcut.take() {
+            if started.elapsed() < Duration::from_secs(2)
+                && matches!(key.code, KeyCode::Char(c) if c.to_ascii_lowercase() == prefix)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                match prefix {
+                    'r' => self.switch_view(View::Repositories),
+                    'c' => self.switch_view(View::Configurations),
+                    'p' => self.request_pull(),
+                    _ => {}
+                }
+                return true;
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(c @ ('r' | 'c' | 'p')) = key.code {
+                self.shortcut = Some((c, Instant::now()));
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn shortcut_hint(&self) -> Option<String> {
+        self.shortcut
+            .filter(|(_, t)| t.elapsed() < Duration::from_secs(2))
+            .map(|(c, _)| {
+                format!(
+                    "Press {c} again for {}",
+                    match c {
+                        'c' => "Configurations",
+                        'r' => "Repositories",
+                        _ => "Pull all",
+                    }
+                )
+            })
+    }
+
+    fn switch_view(&mut self, view: View) {
+        if let Some(form) = self.form.as_mut().filter(|e| e.dirty()) {
+            form.notice = "Unsaved changes: Ctrl+S save or Ctrl+D discard and close".into();
+            return;
+        }
+        if self.form.take().is_some() {
+            self.refresh();
+        }
+        self.popup = None;
+        self.save_popup = None;
+        self.branch_popup = None;
+        self.filter_editing = false;
+        self.view = view;
+        if view == View::Configurations {
+            self.discover_configs();
+        }
+        self.focus = if view == View::Repositories && !self.has_submodules() {
+            Focus::Commits
+        } else {
+            Focus::Repos
+        };
+    }
+
+    pub fn discover_configs(&mut self) {
+        let selected = self
+            .config_modules
+            .get(self.config_repos.selected())
+            .map(|m| m.root.clone());
+        self.config_modules.clear();
+        if let Some(ov) = &self.overview {
+            for (i, sm) in ov.submodules.iter().enumerate() {
+                if let Some(root) = &sm.workdir {
+                    match config::discover(root) {
+                        Ok(files) if !files.is_empty() => self.config_modules.push(ConfigModule {
+                            entry_idx: i + 1,
+                            name: sm.path.clone(),
+                            root: root.clone(),
+                            files,
+                        }),
+                        Err(e) => self.status = format!("{}: {e:#}", sm.path),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.config_repos.set_len(self.config_modules.len());
+        if let Some(idx) = self
+            .config_modules
+            .iter()
+            .position(|m| Some(&m.root) == selected.as_ref())
+        {
+            self.config_repos.select(idx);
+        }
+        self.select_config_module(self.config_repos.selected());
+    }
+
+    fn select_config_module(&mut self, idx: usize) {
+        let previous = self.config_repos.selected();
+        self.config_repos.select(idx);
+        let len = self
+            .config_modules
+            .get(self.config_repos.selected())
+            .map(|m| m.files.len())
+            .unwrap_or(0);
+        if previous != self.config_repos.selected() {
+            self.config_files = ScrollState::new(len);
+        } else {
+            self.config_files.set_len(len);
+        }
+        self.config_repos
+            .ensure_visible(self.pane_heights.repos.max(1));
+    }
+
+    fn handle_config_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
+            KeyCode::Char('?') => {
+                self.report_scroll = 0;
+                self.popup = Some(Popup::Help);
+            }
+            KeyCode::Char('n') => {
+                self.report_scroll = 0;
+                self.popup = Some(Popup::Network);
+            }
+            KeyCode::Char('r') => {
+                self.refresh();
+                self.discover_configs();
+            }
+            KeyCode::Tab | KeyCode::BackTab => self.focus = self.focus.toggle(),
+            KeyCode::Left => self.focus = Focus::Repos,
+            KeyCode::Right => self.focus = Focus::Commits,
+            KeyCode::Enter => {
+                if self.focus == Focus::Repos {
+                    self.focus = Focus::Commits;
+                } else {
+                    self.open_config();
+                }
+            }
+            _ => {
+                let (scroll, page) = if self.focus == Focus::Repos {
+                    (&mut self.config_repos, self.pane_heights.repos)
+                } else {
+                    (&mut self.config_files, self.pane_heights.commits)
+                };
+                let previous = scroll.selected();
+                match code {
+                    KeyCode::Up | KeyCode::Char('k') => scroll.move_by(-1),
+                    KeyCode::Down | KeyCode::Char('j') => scroll.move_by(1),
+                    KeyCode::PageUp => scroll.page_by(page, -1),
+                    KeyCode::PageDown => scroll.page_by(page, 1),
+                    KeyCode::Home => scroll.first(),
+                    KeyCode::End => scroll.last(),
+                    _ => {}
+                }
+                let selected = scroll.selected();
+                scroll.ensure_visible(page.max(1));
+                if self.focus == Focus::Repos && previous != selected {
+                    self.config_files = ScrollState::new(0);
+                    self.select_config_module(selected);
+                }
+            }
+        }
+    }
+
+    fn open_config(&mut self) {
+        if self.is_pulling() {
+            self.status = "Wait for the remote operation before editing config files".into();
+            return;
+        }
+        let path = self
+            .config_modules
+            .get(self.config_repos.selected())
+            .and_then(|m| m.files.get(self.config_files.selected()))
+            .cloned();
+        if let Some(path) = path {
+            match config::Form::open(path) {
+                Ok(form) => self.form = Some(form),
+                Err(e) => self.status = format!("{e:#}"),
+            }
+        }
+    }
+
+    fn handle_form_key(&mut self, key: KeyEvent) {
+        let form = self.form.as_mut().unwrap();
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Err(e) = form.save() {
+                form.notice = format!("{e:#}");
+            } else {
+                self.refresh();
+            }
+        } else if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.form = None;
+            self.refresh();
+        } else if key.code == KeyCode::Esc && (form.editing.is_some() || form.filtering) {
+            form.key(key.code, key.modifiers, self.pane_heights.commits);
+        } else if key.code == KeyCode::Esc {
+            if form.dirty() {
+                form.notice = "Unsaved changes: Ctrl+S save or Ctrl+D discard and close".into();
+            } else {
+                self.form = None;
+                self.refresh();
+            }
+        } else {
+            form.key(key.code, key.modifiers, self.pane_heights.commits);
+        }
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        if let Some(form) = &mut self.form {
+            form.paste(text);
+        }
+    }
+
+    fn request_pull(&mut self) {
+        if !self.can_start_network(network::Operation::Pull) {
+            return;
+        }
+        self.branch_popup = None;
+        self.save_popup = None;
+        self.filter_editing = false;
+        self.popup = Some(Popup::PullConfirm);
+    }
+
+    fn can_start_network(&mut self, operation: network::Operation) -> bool {
+        if self.mode != Mode::Normal {
+            return false;
+        }
+        if self.network_job.is_some() {
+            self.status =
+                "Remote operation already running; retry Ctrl+P,P after it finishes".into();
+            return false;
+        }
+        if let Some(form) = self.form.as_mut() {
+            form.notice = "Close the config form before pulling".into();
+            return false;
+        }
+        if operation == network::Operation::Pull && self.entries.iter().any(|e| e.pick.is_some()) {
+            self.status =
+                "Apply or clear pending commit picks before pulling all repositories".into();
+            return false;
+        }
+        self.overview.is_some()
+    }
+
+    pub fn start_network(&mut self, operation: network::Operation) {
+        if !self.can_start_network(operation) {
+            return;
+        }
+        let Some(ov) = &self.overview else {
+            return;
+        };
+        // Snapshot all targets before the superproject's pull can change .gitmodules.
+        let mut targets = vec![network::Target {
+            name: self.entry_name(0),
+            path: Some(ov.root.clone()),
+        }];
+        for sm in &ov.submodules {
+            targets.push(network::Target {
+                name: sm.path.clone(),
+                path: sm.workdir.clone(),
+            });
+        }
+        self.status = if operation == network::Operation::Pull {
+            "Pulling all repositories…"
+        } else {
+            "Checking remote updates…"
+        }
+        .into();
+        self.network_operation = Some(operation);
+        if operation == network::Operation::Pull {
+            self.branch_popup = None;
+            self.save_popup = None;
+            self.popup = None;
+            self.filter_editing = false;
+        }
+        self.network_job = Some(network::start(targets, operation));
+    }
+
+    pub fn poll_network(&mut self) {
+        let Some(rx) = self.network_job.as_ref() else {
+            return;
+        };
+        let event = match rx.try_recv() {
+            Ok(event) => event,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                self.network_job = None;
+                self.status = "Remote worker stopped unexpectedly; press r to refresh".into();
+                return;
+            }
+        };
+        match event {
+            network::Event::Progress(text) => self.status = text,
+            network::Event::Done(results) => {
+                let failed = results.iter().filter(|(_, r)| r.is_err()).count();
+                self.network_results = results;
+                self.network_job = None;
+                let pulling = self.network_operation.take() == Some(network::Operation::Pull);
+                self.status = format!(
+                    "{} complete: {} succeeded, {failed} failed · n results",
+                    if pulling { "Pull" } else { "Update check" },
+                    self.network_results.len() - failed
+                );
+                self.refresh();
+                if self.view == View::Configurations {
+                    self.discover_configs();
+                }
+                if pulling {
+                    self.report_scroll = 0;
+                    self.popup = Some(Popup::Network);
+                }
+            }
+        }
+    }
+
+    fn refresh_updates(&mut self) {
+        for idx in 0..self.entries.len() {
+            self.ensure_sub_repo(idx);
+            let repo = if idx == 0 {
+                self.repo.as_ref()
+            } else {
+                self.sub_repos[idx - 1].as_ref()
+            };
+            if let Some(repo) = repo {
+                let entry = &mut self.entries[idx];
+                entry.branch = gitx::selected_branch(repo, entry.branch.as_deref());
+                entry.updates = gitx::update_info(repo, entry.branch.as_deref());
+            }
+        }
+    }
+
+    fn is_pulling(&self) -> bool {
+        self.network_job.is_some() && self.network_operation == Some(network::Operation::Pull)
     }
 
     fn handle_message_key(&mut self, code: KeyCode) {
@@ -443,8 +886,15 @@ impl App {
 
     fn handle_normal_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.should_quit = true,
-            KeyCode::Char('?') => self.popup = Some(Popup::Help),
+            KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
+            KeyCode::Char('n') => {
+                self.report_scroll = 0;
+                self.popup = Some(Popup::Network);
+            }
+            KeyCode::Char('?') => {
+                self.report_scroll = 0;
+                self.popup = Some(Popup::Help);
+            }
             KeyCode::Char('r') | KeyCode::Char('R') => self.refresh(),
             KeyCode::Char('b') | KeyCode::Char('B') => self.open_branch_popup(),
             KeyCode::Char('s') | KeyCode::Char('S') => self.open_save_popup(),
@@ -552,6 +1002,20 @@ impl App {
             self.branch_scroll(dir * WHEEL_STEP);
             return;
         }
+        if let Some(form) = &mut self.form {
+            if form.editing.is_none() && !form.filtering {
+                form.key(
+                    if dir < 0 { KeyCode::Up } else { KeyCode::Down },
+                    KeyModifiers::NONE,
+                    self.pane_heights.commits,
+                );
+            }
+            return;
+        }
+        if self.view == View::Configurations {
+            self.handle_config_key(if dir < 0 { KeyCode::Up } else { KeyCode::Down });
+            return;
+        }
         match self.focus {
             Focus::Repos => {
                 self.repos.move_by(dir);
@@ -569,6 +1033,35 @@ impl App {
     }
 
     fn handle_click(&mut self, col: u16, row: u16) {
+        let hit = self.hit_test(col, row);
+        if self.popup == Some(Popup::PullConfirm) {
+            match hit {
+                Some(Hit::PullConfirm) => self.start_network(network::Operation::Pull),
+                Some(Hit::PullCancel) => self.popup = None,
+                _ => {}
+            }
+            return;
+        }
+        if self.form.is_some() {
+            if hit == Some(Hit::ParameterSave) {
+                self.handle_form_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+                return;
+            }
+            if hit == Some(Hit::ParameterBack) {
+                self.handle_form_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                return;
+            }
+        }
+        if let Some(form) = &mut self.form {
+            if let Some(Hit::ParameterRow(i)) = hit {
+                if form.editing.is_some() {
+                    return;
+                }
+                form.scroll.select(i);
+                form.activate();
+            }
+            return;
+        }
         // Save popup: buttons act, clicks inside the body are ignored,
         // clicks outside close it (Cancel never applies anything).
         if self.mode == Mode::Normal && self.save_popup.is_some() {
@@ -606,6 +1099,15 @@ impl App {
             return;
         }
         match self.hit_test(col, row) {
+            Some(Hit::ConfigModule(i)) => {
+                self.focus = Focus::Repos;
+                self.select_config_module(i);
+            }
+            Some(Hit::ConfigFile(i)) => {
+                self.focus = Focus::Commits;
+                self.config_files.select(i);
+                self.open_config();
+            }
             Some(Hit::RepoRow(i)) => {
                 self.focus = Focus::Repos;
                 self.repos.select(i);
@@ -685,6 +1187,10 @@ impl App {
 
     /// Open the branch switcher for the entry selected in the repos pane.
     fn open_branch_popup(&mut self) {
+        if self.is_pulling() {
+            self.status = "Wait for the remote operation before switching branches".into();
+            return;
+        }
         if self.mode != Mode::Normal {
             return;
         }
@@ -729,6 +1235,9 @@ impl App {
     /// everything. A refused switch (dirty tree) keeps the popup open with
     /// the error as its notice.
     fn switch_selected_branch(&mut self) {
+        if self.is_pulling() {
+            return;
+        }
         let Some((idx, name)) = self.branch_popup.as_ref().and_then(|bp| {
             bp.branches
                 .get(bp.scroll.selected())
@@ -774,6 +1283,10 @@ impl App {
     /// refreshed first so warnings reflect the working trees as they are
     /// right now, not as they were at startup.
     fn open_save_popup(&mut self) {
+        if self.is_pulling() {
+            self.status = "Wait for the remote operation before applying commit picks".into();
+            return;
+        }
         if self.mode != Mode::Normal {
             return;
         }
@@ -832,6 +1345,9 @@ impl App {
     /// submodule pointer. Failures are collected, never abort the run, and
     /// keep their pick for a retry.
     fn apply_saves(&mut self) {
+        if self.is_pulling() {
+            return;
+        }
         // Fresh plan: state may have drifted since the popup opened.
         let mut plan = Vec::new();
         for idx in 0..self.entries.len() {
@@ -1100,6 +1616,10 @@ impl App {
     /// main repository should record for the selected entry. Picking the
     /// currently recorded commit is a no-op (clears the pick).
     fn toggle_pick(&mut self) {
+        if self.is_pulling() {
+            self.status = "Wait for the remote operation before picking commits".into();
+            return;
+        }
         let idx = self.repos.selected();
         let current = self.current_oid(idx);
         let Some(entry) = self.entries.get_mut(idx) else {
@@ -1136,6 +1656,11 @@ impl App {
             .filter_map(|e| e.pick.map(|p| (e.key.clone(), p)))
             .collect();
 
+        let branches: Vec<_> = self
+            .entries
+            .iter()
+            .map(|e| (e.key.clone(), e.branch.clone()))
+            .collect();
         let n = ov.submodules.len();
         let mut entries = vec![EntryState::new(EntryKey::Main)];
         for sm in &ov.submodules {
@@ -1144,6 +1669,11 @@ impl App {
         for (key, oid) in picks {
             if let Some(entry) = entries.iter_mut().find(|e| e.key == key) {
                 entry.pick = Some(oid);
+            }
+        }
+        for (key, branch) in branches {
+            if let Some(entry) = entries.iter_mut().find(|e| e.key == key) {
+                entry.branch = branch;
             }
         }
 
@@ -1160,6 +1690,7 @@ impl App {
             self.focus = Focus::Commits;
         }
         self.ensure_entry_loaded(self.repos.selected());
+        self.refresh_updates();
     }
 }
 
@@ -1176,10 +1707,6 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn ctrl_c() -> KeyEvent {
-        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
     }
 
     fn click(col: u16, row: u16) -> MouseEvent {
@@ -1248,11 +1775,164 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_quits_even_with_popup_open() {
+    fn ctrl_q_quits_even_with_popup_open() {
         let (mut app, _t) = normal_app();
         app.popup = Some(Popup::Help);
-        app.handle_key(ctrl_c());
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn config_shortcuts_filter_modules_and_save_the_selected_file() {
+        let (mut app, temp) = normal_app();
+        let file = temp.path().join("super/subA/ros_pkg/config/tuning.yaml");
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, "gain: 1\n").unwrap();
+        // The main repo has a config, but the configurations view is submodule-only.
+        fs::create_dir_all(temp.path().join("super/config")).unwrap();
+        fs::write(temp.path().join("super/config/main.yaml"), "main: true").unwrap();
+        app.select_repo(1);
+        app.entries[1].pick = app.entries[1].log.get(1).map(|c| c.oid);
+        let pick = app.entries[1].pick;
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.should_quit);
+        assert_eq!(app.view, View::Repositories);
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.view, View::Configurations);
+        assert_eq!(app.config_modules.len(), 1);
+        assert_eq!(app.config_modules[0].entry_idx, 1);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('2')));
+        assert!(
+            !app.form.as_ref().unwrap().dirty(),
+            "typing outside a value input cannot edit YAML"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('2')));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.form.is_some(), "unsaved edits prevent accidental close");
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert_eq!(
+            app.view,
+            View::Configurations,
+            "unsaved edits prevent view switching"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), "gain: 1\n");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "gain: 2\n");
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Repositories);
+        assert_eq!(
+            app.entries[1].pick, pick,
+            "view changes retain commit picks"
+        );
+    }
+
+    #[test]
+    fn shortcuts_expire_and_plain_characters_do_not_switch_views() {
+        let (mut app, _temp) = normal_app();
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.view, View::Repositories);
+        app.shortcut = Some(('c', Instant::now() - Duration::from_secs(3)));
+        app.handle_key(key(KeyCode::Char('c')));
+        assert_eq!(app.view, View::Repositories);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(app.view, View::Configurations);
+        assert!(app.config_modules.is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.form.is_none());
+    }
+
+    #[test]
+    fn retained_branch_badge_survives_a_detached_commit_pick() {
+        let (mut app, _temp) = normal_app();
+        let repo = app.repo.as_ref().unwrap();
+        let old = repo
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_id(0)
+            .unwrap();
+        gitops::checkout_oid(repo, old).unwrap();
+        app.refresh();
+        assert_eq!(app.entries[0].branch.as_deref(), Some("main"));
+        assert_eq!(app.entries[0].updates.as_ref().unwrap().newer, 1);
+    }
+
+    #[test]
+    fn pull_shortcut_runs_all_entries_and_collects_partial_failures() {
+        let (mut app, _temp) = normal_app();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.popup, Some(Popup::PullConfirm));
+        assert!(
+            app.network_job.is_none(),
+            "shortcut only requests confirmation"
+        );
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.network_job.is_some());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.network_job.is_some() {
+            assert!(Instant::now() < deadline, "pull-all worker must complete");
+            app.poll_network();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.network_results.len(), 3);
+        assert!(app.network_results[0].1.is_ok());
+        assert!(app.network_results[1].1.is_ok());
+        assert!(app.network_results[2].1.is_err());
+        assert_eq!(app.popup, Some(Popup::Network));
+    }
+
+    #[test]
+    fn pull_confirmation_is_modal_and_cancellation_never_starts_a_worker() {
+        let (mut app, _temp) = normal_app();
+        assert!(app.network_job.is_none(), "startup has no remote operation");
+        for cancel in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('n')] {
+            app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+            app.handle_key(key(KeyCode::Char('p')));
+            assert_eq!(app.popup, Some(Popup::PullConfirm));
+            app.handle_key(key(KeyCode::Char('p')));
+            app.handle_key(key(KeyCode::Char('s')));
+            assert!(app.network_job.is_none());
+            assert!(app.save_popup.is_none());
+            app.handle_key(key(cancel));
+            assert_eq!(app.popup, None);
+            assert!(app.network_job.is_none());
+            assert!(!app.should_quit);
+        }
+    }
+
+    #[test]
+    fn pull_confirmation_preserves_pending_picks_and_open_forms() {
+        let (mut app, temp) = normal_app();
+        app.entries[0].pick = app.overview.as_ref().unwrap().head_oid;
+        app.request_pull();
+        assert_eq!(app.popup, None);
+        assert!(app.network_job.is_none());
+        assert!(app.status.contains("pending commit picks"));
+        app.entries[0].pick = None;
+        let file = temp.path().join("params.yaml");
+        fs::write(&file, "gain: 1\n").unwrap();
+        app.form = Some(config::Form::open(file).unwrap());
+        app.request_pull();
+        assert_eq!(app.popup, None);
+        assert!(app.network_job.is_none());
+        assert!(
+            app.form
+                .as_ref()
+                .unwrap()
+                .notice
+                .contains("Close the config form")
+        );
     }
 
     #[test]

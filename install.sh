@@ -6,7 +6,8 @@ usage() {
     printf '%s\n' 'Usage: ./install.sh [--tag vX.Y.Z] [--bin PATH] [--dry-run]' \
         '  --bin PATH   install a local binary without network access' \
         '  --tag TAG    install a specific release (default: latest)' \
-        '  --dry-run    print the planned actions without changing files'
+        '  --dry-run    print the planned actions without changing files' \
+        'Running again replaces the installed binary with the selected version.'
 }
 
 fail() { printf 'taid installer: %s\n' "$*" >&2; exit 1; }
@@ -113,7 +114,7 @@ if [ "$dry_run" = true ]; then
         printf 'Archive: %s\nChecksums: %s\n' "$archive_url" "$sums_url"
         [ -z "${auth_token:-}" ] || printf 'Authentication: GH_TOKEN via GitHub API\n'
     fi
-    printf 'Install: %s\nPATH rc: %s (only if needed)\n' "$install_dir/$binary" "$rc"
+    printf 'Install/update: %s\nPATH rc: %s (only if needed)\n' "$install_dir/$binary" "$rc"
     exit 0
 fi
 
@@ -150,13 +151,16 @@ if [ -z "$local_bin" ]; then
     source_bin="$tmp_dir/$binary"
 fi
 
+[ ! -d "$install_dir/$binary" ] || fail "installation target is a directory: $install_dir/$binary"
+install_action=Installed
+if [ -e "$install_dir/$binary" ] || [ -L "$install_dir/$binary" ]; then install_action=Updated; fi
 mkdir -p "$install_dir"
 stage_bin=$(mktemp "$install_dir/.taid.XXXXXXXX") || fail 'could not stage installed binary'
 cp "$source_bin" "$stage_bin"
 chmod 755 "$stage_bin"
 mv -f "$stage_bin" "$install_dir/$binary"
 stage_bin=
-printf 'Installed %s\n' "$install_dir/$binary"
+printf '%s %s\n' "$install_action" "$install_dir/$binary"
 
 case ":$PATH:" in
     *":$install_dir:"*) printf '%s is already on PATH.\n' "$install_dir" ;;

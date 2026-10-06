@@ -4,7 +4,9 @@
 use std::io::{self, Stdout};
 
 use anyhow::{Context, Result};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -20,7 +22,12 @@ pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(move |info| {
         // Best effort: leave raw mode and the alternate screen first.
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         default_hook(info);
     }));
 }
@@ -29,8 +36,13 @@ pub fn init() -> Result<Tui> {
     enable_raw_mode().context("taid needs an interactive terminal")?;
     let result = (|| {
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
-            .context("preparing the terminal")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )
+        .context("preparing the terminal")?;
         let mut terminal =
             Terminal::new(CrosstermBackend::new(stdout)).context("preparing the terminal")?;
         terminal.hide_cursor().context("preparing the terminal")?;
@@ -39,7 +51,12 @@ pub fn init() -> Result<Tui> {
     if result.is_err() {
         // EnterAlternateScreen may have succeeded before a later setup step
         // failed, so restore both terminal modes on every partial failure.
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
     result
@@ -49,6 +66,7 @@ pub fn restore(terminal: &mut Tui) {
     let _ = terminal.show_cursor();
     let _ = execute!(
         terminal.backend_mut(),
+        DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen
     );

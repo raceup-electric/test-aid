@@ -3,7 +3,7 @@ name = "taid"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A local-first TUI to manage which commits your repository records for its submodules"
+description = "A terminal UI for driverless repositories, submodule commits and module configurations"
 license = "MIT"
 readme = "README.md"
 keywords = ["git", "submodules", "tui", "terminal"]
@@ -17,13 +17,15 @@ ratatui = "0.29"
 crossterm = "0.28"
 
 # Git operations via vendored libgit2: statically linked into the binary,
-# with no ssh/https features so nothing can ever touch the network.
+# without ssh/https features. Explicit remote operations use system Git so
+# existing SSH aliases and credential helpers work without extra setup.
 git2 = { version = "0.20", default-features = false, features = ["vendored-libgit2"] }
 
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
+yaml-rust2 = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 # Integration tests drive the real binary in a pseudo-terminal
