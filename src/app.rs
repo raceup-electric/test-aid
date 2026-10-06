@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use anyhow::anyhow;
+use anyhow::{Context, Result, anyhow};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -135,6 +135,13 @@ pub enum Hit {
     ParameterRow(usize),
     ParameterSave,
     ParameterBack,
+    ParameterHistory,
+    ConfigConfirm,
+    ConfigCancel,
+    HistoryRow(usize),
+    HistoryCompare,
+    HistoryVersion,
+    HistoryRestore,
     PullPopup,
     PullConfirm,
     PullCancel,
@@ -310,10 +317,15 @@ pub struct App {
     pub config_repos: ScrollState,
     pub config_files: ScrollState,
     pub form: Option<config::Form>,
+    pub global_history: Option<crate::history::Browser>,
+    pub batch_review: Option<crate::session::Review>,
+    session: Option<crate::session::Session>,
+    session_started: std::time::SystemTime,
     pub status: String,
     pub network_results: Vec<(String, Result<String, String>)>,
     pub report_scroll: usize,
     pub network_job: Option<Receiver<network::Event>>,
+    pub network_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     network_operation: Option<network::Operation>,
     shortcut: Option<(char, Instant)>,
     /// Message shown by the NotRepo/Error popup.
@@ -364,10 +376,15 @@ impl App {
             config_repos: ScrollState::new(0),
             config_files: ScrollState::new(0),
             form: None,
+            global_history: None,
+            batch_review: None,
+            session: None,
+            session_started: std::time::SystemTime::now(),
             status: String::new(),
             network_results: Vec::new(),
             report_scroll: 0,
             network_job: None,
+            network_cancel: None,
             network_operation: None,
             shortcut: None,
             message: msg.into(),
@@ -402,10 +419,15 @@ impl App {
             config_repos: ScrollState::new(0),
             config_files: ScrollState::new(0),
             form: None,
+            global_history: None,
+            batch_review: None,
+            session: None,
+            session_started: std::time::SystemTime::now(),
             status: String::new(),
             network_results: Vec::new(),
             report_scroll: 0,
             network_job: None,
+            network_cancel: None,
             network_operation: None,
             shortcut: None,
             message: String::new(),
@@ -474,6 +496,13 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        if key.code == KeyCode::Char('x') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Some(cancel) = &self.network_cancel {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                self.status = "Cancellation requested; fetches stop, an active checkout finishes, remaining repositories are skipped".into();
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && (key.code == KeyCode::Char('q')
                 || (self.mode != Mode::Normal && key.code == KeyCode::Char('c')))
@@ -481,7 +510,15 @@ impl App {
             self.request_quit();
             return;
         }
+        if self.batch_review.is_some() {
+            self.handle_batch_key(key);
+            return;
+        }
         if self.mode == Mode::Normal && self.handle_shortcut(key) {
+            return;
+        }
+        if self.global_history.is_some() {
+            self.handle_global_history_key(key);
             return;
         }
         if self.form.is_some() {
@@ -512,7 +549,7 @@ impl App {
                 | KeyCode::Char('Q') => self.popup = None,
                 KeyCode::Down | KeyCode::Char('j') => {
                     let limit = if self.popup == Some(Popup::Help) {
-                        24
+                        40
                     } else {
                         self.network_results.len().saturating_sub(1)
                     };
@@ -589,6 +626,7 @@ impl App {
             self.refresh();
         }
         self.popup = None;
+        self.global_history = None;
         self.save_popup = None;
         self.branch_popup = None;
         self.filter_editing = false;
@@ -655,6 +693,7 @@ impl App {
 
     fn handle_config_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('h') | KeyCode::Char('H') => self.open_global_history(),
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Char('?') => {
                 self.report_scroll = 0;
@@ -715,20 +754,260 @@ impl App {
             .and_then(|m| m.files.get(self.config_files.selected()))
             .cloned();
         if let Some(path) = path {
-            match config::Form::open(path) {
+            let root = &self.overview.as_ref().unwrap().root;
+            match config::Form::open_in(path, root) {
                 Ok(form) => self.form = Some(form),
                 Err(e) => self.status = format!("{e:#}"),
             }
         }
     }
 
-    fn handle_form_key(&mut self, key: KeyEvent) {
-        let form = self.form.as_mut().unwrap();
-        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let Err(e) = form.save() {
-                form.notice = format!("{e:#}");
+    fn open_global_history(&mut self) {
+        if let Some(form) = self.form.as_mut().filter(|f| f.dirty()) {
+            form.notice =
+                "Save or discard pending config edits before opening global history".into();
+            return;
+        }
+        let Some(ov) = &self.overview else {
+            return;
+        };
+        match crate::history::Browser::open(&ov.root) {
+            Ok(browser) => {
+                self.global_history = Some(browser);
+                self.popup = None;
+                self.save_popup = None;
+                self.branch_popup = None;
+                self.filter_editing = false;
+            }
+            Err(e) => {
+                self.status = format!("Global history unavailable: {e:#}");
+                if let Some(form) = &mut self.form {
+                    form.notice = self.status.clone();
+                }
+            }
+        }
+    }
+
+    fn handle_global_history_key(&mut self, key: KeyEvent) {
+        let action = self.global_history.as_mut().unwrap().key(
+            key.code,
+            key.modifiers,
+            self.pane_heights.commits.max(1),
+        );
+        match action {
+            crate::history::BrowserAction::None => {}
+            crate::history::BrowserAction::Close => self.global_history = None,
+            crate::history::BrowserAction::Restore => {
+                if let Err(e) = self.restore_global_history() {
+                    self.global_history.as_mut().unwrap().notice =
+                        format!("Cannot load restore: {e:#}");
+                }
+            }
+            crate::history::BrowserAction::RestoreBatch => {
+                let result = (|| -> Result<crate::session::Review> {
+                    if self.is_pulling() {
+                        anyhow::bail!("wait for the pull operation before restoring");
+                    }
+                    if self.form.as_ref().is_some_and(|f| f.dirty()) {
+                        anyhow::bail!("save/discard current edits before restoring");
+                    }
+                    let browser = self.global_history.as_ref().unwrap();
+                    Ok(crate::session::Review::prepare_project(
+                        &browser.root,
+                        browser.targets()?,
+                        browser.repository_targets()?,
+                        browser.before,
+                        format!(
+                            "{} snapshot · {}",
+                            if browser.before { "before" } else { "after" },
+                            browser.selected_label()
+                        ),
+                        browser.recovery_id(),
+                    ))
+                })();
+                match result {
+                    Ok(review) => self.batch_review = Some(review),
+                    Err(e) => {
+                        self.global_history.as_mut().unwrap().notice =
+                            format!("Cannot review restore: {e:#}")
+                    }
+                }
+            }
+        }
+    }
+
+    fn ensure_session(&mut self) -> Result<String> {
+        if self.session.is_none() {
+            let root = &self.overview.as_ref().context("no opened checkout")?.root;
+            self.session = Some(crate::session::Session::begin(root, self.session_started)?);
+        }
+        Ok(self.session.as_ref().unwrap().id.clone())
+    }
+
+    pub fn finish_session(&self) -> Result<()> {
+        if let Some(session) = &self.session {
+            session.finish()?;
+        }
+        Ok(())
+    }
+
+    fn close_batch_review(&mut self) {
+        self.batch_review = None;
+        self.form = None; // Any underlying form was clean; reopen from current disk.
+        self.refresh();
+        if let Some(browser) = &mut self.global_history {
+            if let Err(e) = browser.reload() {
+                browser.notice = format!("History reload failed: {e:#}");
+            }
+        }
+    }
+
+    fn handle_batch_key(&mut self, key: KeyEvent) {
+        let review = self.batch_review.as_mut().unwrap();
+        if review.note_editing {
+            match key.code {
+                KeyCode::Enter | KeyCode::Esc => review.note_editing = false,
+                KeyCode::Backspace => {
+                    review.note.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    review.note.clear()
+                }
+                KeyCode::Char(c)
+                    if !c.is_control()
+                        && !key
+                            .modifiers
+                            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                        && review.note.chars().count() < 500 =>
+                {
+                    review.note.push(c)
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.close_batch_review(),
+            KeyCode::Enter if review.outcome.is_some() => self.close_batch_review(),
+            KeyCode::Char('n') if review.outcome.is_none() => review.note_editing = true,
+            KeyCode::Enter => {
+                let result = (|| -> Result<()> {
+                    if self.is_pulling() {
+                        anyhow::bail!("remote operation in progress; nothing was written");
+                    }
+                    let id = self.ensure_session()?;
+                    let root = self.overview.as_ref().unwrap().root.clone();
+                    self.batch_review.as_mut().unwrap().confirm(&root, &id)
+                })();
+                if let Err(e) = result {
+                    self.batch_review
+                        .as_mut()
+                        .unwrap()
+                        .errors
+                        .push(format!("{e:#}"));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => review.scroll = review.scroll.saturating_add(1),
+            KeyCode::Up | KeyCode::Char('k') => review.scroll = review.scroll.saturating_sub(1),
+            KeyCode::PageDown => {
+                review.scroll = review
+                    .scroll
+                    .saturating_add(self.pane_heights.commits.max(1))
+            }
+            KeyCode::PageUp => {
+                review.scroll = review
+                    .scroll
+                    .saturating_sub(self.pane_heights.commits.max(1))
+            }
+            KeyCode::Home => review.scroll = 0,
+            KeyCode::End => review.scroll = usize::MAX,
+            _ => {}
+        }
+    }
+
+    fn restore_global_history(&mut self) -> Result<()> {
+        if self.is_pulling() {
+            anyhow::bail!("wait for the pull operation before loading a restore");
+        }
+        if self.form.as_ref().is_some_and(|f| f.dirty()) {
+            anyhow::bail!("save or discard current edits before restoring");
+        }
+        let browser = self.global_history.as_ref().unwrap();
+        let entry = browser.selected().context("no entry selected")?;
+        // Reverify the record on restore, then resolve only a regular file inside
+        // this opened checkout. Historical entries remain viewable if removed.
+        let record = crate::history::Store::load_global(&browser.root, entry)?;
+        let path = crate::history::resolve_config(&browser.root, &record.path)?;
+        let mut form = config::Form::open_in(path.clone(), &browser.root)?;
+        form.restore(
+            if browser.before {
+                &record.before
             } else {
+                &record.after
+            },
+            format!(
+                "{}:{}:{}",
+                record.path,
+                record.id,
+                if browser.before { "before" } else { "after" }
+            ),
+        )?;
+        self.global_history = None;
+        self.view = View::Configurations;
+        self.discover_configs();
+        if let Some(module_idx) = self.config_modules.iter().position(|m| {
+            m.files
+                .iter()
+                .any(|p| p.canonicalize().ok().as_ref() == Some(&path))
+        }) {
+            self.select_config_module(module_idx);
+            if let Some(file_idx) = self.config_modules[module_idx]
+                .files
+                .iter()
+                .position(|p| p.canonicalize().ok().as_ref() == Some(&path))
+            {
+                self.config_files.select(file_idx);
+            }
+        }
+        self.focus = Focus::Commits;
+        self.form = Some(form);
+        Ok(())
+    }
+
+    fn handle_form_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('h')
+            && self
+                .form
+                .as_ref()
+                .is_some_and(|f| f.overlay.is_none() && f.editing.is_none() && !f.filtering)
+        {
+            self.open_global_history();
+            return;
+        }
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            match self.ensure_session() {
+                Ok(id) => self
+                    .form
+                    .as_mut()
+                    .unwrap()
+                    .set_session(&self.overview.as_ref().unwrap().root, &id),
+                Err(e) => {
+                    self.form.as_mut().unwrap().notice =
+                        format!("Session journal unavailable; nothing saved: {e:#}");
+                    return;
+                }
+            }
+        }
+        let form = self.form.as_mut().unwrap();
+        if form.overlay.is_some() {
+            if form.overlay_key(key.code, key.modifiers, self.pane_heights.commits) {
                 self.refresh();
+            }
+            return;
+        }
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let Err(e) = form.request_save() {
+                form.notice = format!("{e:#}");
             }
         } else if key.code == KeyCode::Char('d') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.form = None;
@@ -748,6 +1027,20 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if let Some(review) = &mut self.batch_review {
+            if review.note_editing {
+                review.note.extend(
+                    text.chars()
+                        .filter(|c| !c.is_control())
+                        .take(500usize.saturating_sub(review.note.chars().count())),
+                );
+            }
+            return;
+        }
+        if let Some(history) = &mut self.global_history {
+            history.paste(text);
+            return;
+        }
         if let Some(form) = &mut self.form {
             form.paste(text);
         }
@@ -760,6 +1053,7 @@ impl App {
         self.branch_popup = None;
         self.save_popup = None;
         self.filter_editing = false;
+        self.global_history = None;
         self.popup = Some(Popup::PullConfirm);
     }
 
@@ -802,6 +1096,18 @@ impl App {
                 path: sm.workdir.clone(),
             });
         }
+        let root = ov.root.clone();
+        let recording = if operation == network::Operation::Pull {
+            match self.ensure_session() {
+                Ok(session) => Some(network::Recording { root, session }),
+                Err(e) => {
+                    self.status = format!("Pull not started: history unavailable: {e:#}");
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         self.status = if operation == network::Operation::Pull {
             "Pulling all repositories…"
         } else {
@@ -815,7 +1121,9 @@ impl App {
             self.popup = None;
             self.filter_editing = false;
         }
-        self.network_job = Some(network::start(targets, operation));
+        let (receiver, cancel) = network::start_recorded(targets, operation, recording);
+        self.network_job = Some(receiver);
+        self.network_cancel = Some(cancel);
     }
 
     pub fn poll_network(&mut self) {
@@ -827,7 +1135,12 @@ impl App {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 self.network_job = None;
-                self.status = "Remote worker stopped unexpectedly; press r to refresh".into();
+                self.network_cancel = None;
+                self.network_operation = None;
+                self.network_results.push(("Worker".into(), Err("Remote worker stopped unexpectedly; inspect git status before retrying; outcomes may be partial".into())));
+                self.status = "Remote worker stopped unexpectedly; inspect results and repository status before retrying".into();
+                self.refresh();
+                self.popup = Some(Popup::Network);
                 return;
             }
         };
@@ -837,6 +1150,7 @@ impl App {
                 let failed = results.iter().filter(|(_, r)| r.is_err()).count();
                 self.network_results = results;
                 self.network_job = None;
+                self.network_cancel = None;
                 let pulling = self.network_operation.take() == Some(network::Operation::Pull);
                 self.status = format!(
                     "{} complete: {} succeeded, {failed} failed · n results",
@@ -886,6 +1200,7 @@ impl App {
 
     fn handle_normal_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('h') | KeyCode::Char('H') => self.open_global_history(),
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Char('n') => {
                 self.report_scroll = 0;
@@ -995,6 +1310,20 @@ impl App {
     }
 
     fn wheel(&mut self, dir: i32) {
+        if self.batch_review.is_some() {
+            self.handle_batch_key(KeyEvent::new(
+                if dir < 0 { KeyCode::Up } else { KeyCode::Down },
+                KeyModifiers::NONE,
+            ));
+            return;
+        }
+        if self.global_history.is_some() {
+            self.handle_global_history_key(KeyEvent::new(
+                if dir < 0 { KeyCode::Up } else { KeyCode::Down },
+                KeyModifiers::NONE,
+            ));
+            return;
+        }
         if self.mode != Mode::Normal || self.popup.is_some() || self.save_popup.is_some() {
             return;
         }
@@ -1003,7 +1332,13 @@ impl App {
             return;
         }
         if let Some(form) = &mut self.form {
-            if form.editing.is_none() && !form.filtering {
+            if form.overlay.is_some() {
+                form.overlay_key(
+                    if dir < 0 { KeyCode::Up } else { KeyCode::Down },
+                    KeyModifiers::NONE,
+                    self.pane_heights.commits,
+                );
+            } else if form.editing.is_none() && !form.filtering {
                 form.key(
                     if dir < 0 { KeyCode::Up } else { KeyCode::Down },
                     KeyModifiers::NONE,
@@ -1034,6 +1369,66 @@ impl App {
 
     fn handle_click(&mut self, col: u16, row: u16) {
         let hit = self.hit_test(col, row);
+        if self.batch_review.is_some() {
+            match hit {
+                Some(Hit::ConfigConfirm) => {
+                    self.batch_review.as_mut().unwrap().note_editing = false;
+                    self.handle_batch_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+                Some(Hit::ConfigCancel) => self.close_batch_review(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(browser) = &mut self.global_history {
+            let code = match hit {
+                Some(Hit::HistoryRow(idx)) => {
+                    browser.select(idx);
+                    None
+                }
+                Some(Hit::HistoryCompare) => Some(KeyCode::Char('c')),
+                Some(Hit::HistoryVersion) => Some(KeyCode::Char('b')),
+                Some(Hit::HistoryRestore) => Some(KeyCode::Char('r')),
+                Some(Hit::ConfigCancel) => {
+                    self.global_history = None;
+                    None
+                }
+                _ => None,
+            };
+            if let Some(code) = code {
+                self.handle_global_history_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            return;
+        }
+        if let Some(form) = self.form.as_mut().filter(|f| f.overlay.is_some()) {
+            if hit == Some(Hit::ConfigCancel) {
+                form.overlay = None;
+                return;
+            }
+            if hit == Some(Hit::ConfigConfirm) {
+                if let Some(config::Overlay::Save { note_editing, .. }) = &mut form.overlay {
+                    *note_editing = false;
+                }
+            }
+            let code = match hit {
+                Some(Hit::ConfigConfirm) => Some(KeyCode::Enter),
+                Some(Hit::ConfigCancel) => Some(KeyCode::Esc),
+                Some(Hit::HistoryCompare) => Some(KeyCode::Char('c')),
+                Some(Hit::HistoryVersion) => Some(KeyCode::Char('b')),
+                Some(Hit::HistoryRestore) => Some(KeyCode::Char('r')),
+                Some(Hit::HistoryRow(idx)) => {
+                    if let Err(e) = form.select_history(idx) {
+                        form.notice = format!("{e:#}");
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(code) = code {
+                self.handle_form_key(KeyEvent::new(code, KeyModifiers::NONE));
+            }
+            return;
+        }
         if self.popup == Some(Popup::PullConfirm) {
             match hit {
                 Some(Hit::PullConfirm) => self.start_network(network::Operation::Pull),
@@ -1043,6 +1438,10 @@ impl App {
             return;
         }
         if self.form.is_some() {
+            if hit == Some(Hit::ParameterHistory) {
+                self.handle_form_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+                return;
+            }
             if hit == Some(Hit::ParameterSave) {
                 self.handle_form_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
                 return;
@@ -1196,7 +1595,6 @@ impl App {
         }
         let idx = self.repos.selected();
         self.ensure_sub_repo(idx);
-
         let (notice, branches) = if idx > 0
             && self
                 .overview
@@ -1245,6 +1643,22 @@ impl App {
         }) else {
             return;
         };
+        let session = match self.ensure_session() {
+            Ok(id) => id,
+            Err(e) => {
+                self.branch_popup.as_mut().unwrap().notice =
+                    Some(format!("History unavailable; branch unchanged: {e:#}"));
+                return;
+            }
+        };
+        let root = self.overview.as_ref().unwrap().root.clone();
+        let module = if idx == 0 {
+            ".".to_owned()
+        } else {
+            self.overview.as_ref().unwrap().submodules[idx - 1]
+                .path
+                .clone()
+        };
         self.ensure_sub_repo(idx);
         let repo = if idx == 0 {
             self.repo.as_ref()
@@ -1254,8 +1668,18 @@ impl App {
         let Some(repo) = repo else {
             return;
         };
-        match gitops::switch_branch(repo, &name) {
-            Ok(()) => {
+        match crate::repository_history::run(
+            &root,
+            &session,
+            "branch switch",
+            &module,
+            &name,
+            || {
+                gitops::switch_branch(repo, &name)?;
+                Ok(format!("Selected branch {name}"))
+            },
+        ) {
+            Ok(_) => {
                 self.branch_popup = None;
                 self.refresh();
             }
@@ -1370,21 +1794,42 @@ impl App {
         }
 
         let mut outcome = ApplyOutcome::default();
+        let session = match self.ensure_session() {
+            Ok(id) => id,
+            Err(e) => {
+                outcome
+                    .failed
+                    .push(("History".into(), format!("No commits applied: {e:#}")));
+                self.save_popup = Some(SaveStage::Result(outcome));
+                return;
+            }
+        };
+        let root = self.overview.as_ref().unwrap().root.clone();
         let repo = self.repo.take();
         for (idx, name, path, pick, current) in plan {
-            let result = if idx == 0 {
-                match repo.as_ref() {
-                    Some(r) => gitops::checkout_oid(r, pick),
-                    None => Err(anyhow!("repository unavailable")),
-                }
-            } else {
-                match (repo.as_ref(), path.as_deref()) {
-                    (Some(r), Some(p)) => gitops::set_submodule_pointer(r, p, pick),
-                    _ => Err(anyhow!("submodule path unavailable")),
-                }
-            };
+            let result = crate::repository_history::run(
+                &root,
+                &session,
+                "commit pick",
+                path.as_deref().unwrap_or("."),
+                &pick.to_string(),
+                || {
+                    let result = if idx == 0 {
+                        match repo.as_ref() {
+                            Some(r) => gitops::checkout_oid(r, pick),
+                            None => Err(anyhow!("repository unavailable")),
+                        }
+                    } else {
+                        match (repo.as_ref(), path.as_deref()) {
+                            (Some(r), Some(p)) => gitops::set_submodule_pointer(r, p, pick),
+                            _ => Err(anyhow!("submodule path unavailable")),
+                        }
+                    };
+                    result.map(|()| format!("Applied commit {pick}"))
+                },
+            );
             match result {
-                Ok(()) => {
+                Ok(_) => {
                     outcome.applied.push(format!(
                         "{name}: {} → {}",
                         current.map(short_oid).unwrap_or_else(|| "—".into()),
@@ -1783,6 +2228,68 @@ mod tests {
     }
 
     #[test]
+    fn global_history_restores_another_module_without_writing_until_confirmation() {
+        let (mut app, temp) = normal_app();
+        let root = temp.path().join("super").canonicalize().unwrap();
+        let mut paths = Vec::new();
+        for module in ["subA", "subB"] {
+            let path = root.join(module).join("config/gains.yaml");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, "gain: 1\n").unwrap();
+            let mut form = config::Form::open_in(path.clone(), &root).unwrap();
+            form.activate();
+            form.paste("2");
+            form.commit_input().unwrap();
+            form.save().unwrap();
+            paths.push(path);
+        }
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.view, View::Repositories);
+        assert_eq!(app.global_history.as_ref().unwrap().entries.len(), 2);
+        app.handle_key(key(KeyCode::Esc));
+        // A clean form in one module may restore a different module's save.
+        app.form = Some(config::Form::open_in(paths[0].clone(), &root).unwrap());
+        app.handle_key(key(KeyCode::Char('h')));
+        let browser = app.global_history.as_mut().unwrap();
+        browser.key(KeyCode::Char('/'), KeyModifiers::NONE, 10);
+        browser.paste("subB");
+        browser.key(KeyCode::Enter, KeyModifiers::NONE, 10);
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app.global_history.is_none());
+        assert_eq!(app.view, View::Configurations);
+        assert_eq!(app.form.as_ref().unwrap().path, paths[1]);
+        assert!(app.form.as_ref().unwrap().dirty());
+        assert_eq!(fs::read_to_string(&paths[1]).unwrap(), "gain: 2\n");
+        // Pending restoration cannot be silently abandoned by opening history.
+        app.handle_key(key(KeyCode::Char('h')));
+        assert!(app.global_history.is_none());
+        assert!(
+            app.form
+                .as_ref()
+                .unwrap()
+                .notice
+                .contains("Save or discard")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            app.form.as_ref().unwrap().overlay,
+            Some(config::Overlay::Save { .. })
+        ));
+        assert_eq!(fs::read_to_string(&paths[1]).unwrap(), "gain: 2\n");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(fs::read_to_string(&paths[1]).unwrap(), "gain: 1\n");
+        assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "gain: 2\n");
+        assert_eq!(
+            crate::history::Store::list_global(&root, &[])
+                .unwrap()
+                .0
+                .len(),
+            3
+        );
+    }
+
+    #[test]
     fn config_shortcuts_filter_modules_and_save_the_selected_file() {
         let (mut app, temp) = normal_app();
         let file = temp.path().join("super/subA/ros_pkg/config/tuning.yaml");
@@ -1822,6 +2329,12 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&file).unwrap(), "gain: 1\n");
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "gain: 1\n",
+            "save needs confirmation"
+        );
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(fs::read_to_string(&file).unwrap(), "gain: 2\n");
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
@@ -1890,6 +2403,14 @@ mod tests {
         assert!(app.network_results[1].1.is_ok());
         assert!(app.network_results[2].1.is_err());
         assert_eq!(app.popup, Some(Popup::Network));
+        let root = &app.overview.as_ref().unwrap().root;
+        let events = crate::repository_history::events(root).unwrap().0;
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|e| e.intent.session == app.session.as_ref().unwrap().id)
+        );
     }
 
     #[test]
@@ -1909,6 +2430,36 @@ mod tests {
             assert!(app.network_job.is_none());
             assert!(!app.should_quit);
         }
+    }
+
+    #[test]
+    fn worker_disconnect_clears_busy_state_and_reports_uncertain_outcomes() {
+        let (mut app, _temp) = normal_app();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        app.network_job = Some(rx);
+        app.network_cancel = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )));
+        app.network_operation = Some(network::Operation::Pull);
+        app.poll_network();
+        assert!(
+            app.network_job.is_none()
+                && app.network_cancel.is_none()
+                && app.network_operation.is_none()
+        );
+        assert_eq!(app.popup, Some(Popup::Network));
+        assert!(
+            app.network_results
+                .last()
+                .unwrap()
+                .1
+                .as_ref()
+                .unwrap_err()
+                .contains("partial")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -2368,6 +2919,9 @@ mod tests {
         );
         // History still shows every commit (HEAD + branches).
         assert_eq!(app.entries[0].log.len(), 2);
+        let events = crate::repository_history::events(&ov.root).unwrap().0;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].intent.kind, "branch switch");
     }
 
     #[test]
@@ -2634,6 +3188,9 @@ mod tests {
             .target()
             .unwrap();
         assert_eq!(sub_main, tip, "newer commits still reachable on the branch");
+        let events = crate::repository_history::events(&ov.root).unwrap().0;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].intent.kind, "commit pick");
     }
 
     #[test]

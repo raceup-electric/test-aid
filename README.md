@@ -111,7 +111,7 @@ The red `● dirty` marker means the worktree or staging area differs from HEAD:
 edited files, untracked files, staged changes, or changed submodule checkouts.
 Saving config parameters makes that module dirty until the changes are committed
 or reverted. The marker does not mean that new remote commits are available;
-those use the yellow `[new]` badge.
+those use the yellow `[new: N]` badge.
 
 Select a commit with `Enter` to mark it as a pending pick. Press `s` to review
 the changes, then `Enter` or click **Apply** to save them. Closing the popup or
@@ -157,8 +157,13 @@ text fields are quoted/escaped automatically. Pasted content must be a single
 parameter value. Nulls, aliases, tagged/anchored and multiline values are
 read-only; merge keys and complex/duplicate mapping keys are refused.
 
-`Ctrl+S` validates pending input and the resulting YAML schema, then writes values
-directly to the file. You can also click **Save** or **Back** in the form.
+`Ctrl+S` validates pending input and opens a review popup listing each changed
+parameter's last-saved and proposed values. `Enter` or **Confirm save** writes
+the changes; `Esc` or **Back to edits** returns to the form without losing edits.
+Press `n` in the review popup to enter an optional note (up to 500 characters);
+`Enter`/`Esc` finishes the note, then `Enter` confirms saving. Use `↑`/`↓`,
+`PgUp`/`PgDn`, `Home`/`End` to scroll the preview. You can also click **Save**,
+**Back**, or **History** in the form.
 Saving does not stage or commit changes. Saves preserve comments,
 line endings, file permissions and all untouched formatting. UTF-8 files up to
 2 MiB are supported. Saving refuses to overwrite a file changed by another process.
@@ -166,9 +171,152 @@ line endings, file permissions and all untouched formatting. UTF-8 files up to
 `Esc` closes a saved form. Unsaved changes block closing, quitting and view
 switching; save with `Ctrl+S` or use `Ctrl+D` to discard and close.
 
+### Global configuration history and recovery
+
+Every changed config save records full before/after file snapshots, parameter
+changes, UTC timestamp, module and stack-relative file path, branch/checkout commit, optional note, and
+the source of a restore. New saves also carry a unique **taid session ID**:
+one invocation groups every confirmed config save and repository action across
+modules and files. Branch switches, applied commit picks and confirmed pulls
+have durable before/after checkout records, including failed/partial outcomes.
+Individual saves remain durable immediately, not buffered until quitting.
+The first save therefore records the original baseline.
+No-op saves do not create entries. Records are retained without automatic pruning.
+Edits made outside taid are not independently tracked; the next taid save records
+the on-disk version it started from.
+
+Press `h` from Repositories, Configurations, or a clean parameter form (or click
+**History**) to browse saved configuration and repository changes in the opened checkout, including
+its submodules. The top-level list shows sessions, their time spans, affected
+module/file/save counts, description and **active**, **closed**, or **interrupted**
+state. Separate concurrent taid instances have separate session IDs; an OS-held
+lock distinguishes a live instance from an interrupted one. A normal exit marks
+the session closed. Sessions without saves or repository actions do not appear.
+Branch-only and pull-only sessions appear too, including no-op/failed pulls.
+Older entries stay under **Legacy saves**, since their session boundaries cannot
+be reconstructed (a checkout containing only legacy entries opens that list).
+
+Session → repository action / file → individual save navigation keeps intermediate versions available:
+
+- `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` select entries.
+- `Enter` expands a session into repository actions and files, then a file into individual saves.
+  `Backspace` returns to the parent level.
+- `n` edits the selected session's optional description (up to 500 characters);
+  `Enter` appends the description, `Esc` cancels. Save notes remain separate.
+- `/` searches module/file paths, session descriptions, save notes, branches and commit IDs; `Enter` keeps the
+  search, `Esc` clears it, and `Ctrl+U` clears the search input.
+- `f` toggles between the selected file's history and all files.
+- `R` reloads the catalogue; `w` shows migration/recovery warnings.
+- The default comparison shows **first before → last after** per file for a
+  session/file row. For `gain: 1 → 2 → 3`, the session diff is `1 → 3` while both
+  saves remain accessible. Individual saves show **previous → saved**.
+  Repository diffs show branch/checkout commit and staged submodule gitlinks
+  separately. Local branch tips and fetched remote refs are audit context only;
+  restoring never rewinds them. Action rows retain requests and results, even
+  if the checkout did not change.
+- `c` switches to **current → selected**, previewing what a restore would change.
+- `b` chooses the selected entry's **before** or **after** snapshot as the restore
+  target. The first entry's before snapshot is the baseline; the latest entry's
+  before snapshot undoes the latest save.
+- `Tab` switches navigation between entries and the parameter-diff list.
+- `r` on a session/action/file row opens a review covering **all recorded targets in that row**;
+  `Enter` confirms the displayed writes, `Esc` cancels without writing, and `n`
+  adds an optional restore note. Search/filtering hides rows but does not secretly
+  narrow a session's restore scope; expand and select a file for a smaller restore.
+- `r` on an individual save loads pending form values; `Ctrl+S` reviews and
+  confirms normally. Every changed restored file adds an individual save under
+  the current taid session, so later versions remain available.
+- `u` toggles unfinished multi-file restores. `r` reviews resuming their **after**
+  targets; `b` selects their **before** targets to review rollback. `w` shows
+  observed per-file outcomes. Active/corrupt plans cannot be restored. Successfully
+  confirmed recovery marks the old plan resolved without deleting its snapshots.
+- `h`/`Esc`/`q` closes History. Matching mouse buttons provide the same actions.
+
+Restoring changes only existing compatible parameter values, preserving the
+current file's comments, formatting and permissions. Missing/renamed keys, type
+changes, changed array lengths and differing read-only values block restoration;
+the UI names incompatible fields and lets you compare before deciding. Pending
+edits prevent a blind restore. Later/external parameter edits are explicitly
+flagged in the whole-session review, with their actual current values shown.
+Changes occurring after the preview invalidate confirmation; reopen and review.
+
+Repository restoration uses safe local checkouts and restores explicitly reviewed
+staged gitlinks. It does not pull, force checkout, create/delete branches, or rewind
+branch/remote refs. The recorded branch is reattached only if it still points at
+the recorded commit; otherwise the preview warns and restores a detached HEAD.
+Dirty/staged tracked files block restoring a different commit; a branch change
+at the same commit preserves them. Active Git operations, missing local commits,
+untracked collisions, unsafe paths and preview drift also block restoration. Save or
+restore config rows separately first, or commit/stash outside taid. If a checkout
+would replace a selected config's revision/schema, the whole-session restore is
+blocked: restore the repository and config rows separately with fresh previews.
+No temporary discard/stash is performed. Historical commits are not pinned by
+private Git refs and may become unavailable after Git garbage collection.
+Operations performed outside taid and repository actions from older taid versions
+cannot be reconstructed retroactively.
+
+New history resides only under the **opened checkout's**
+`<actual Git directory>/taid/config-history` (usually
+`driverless-stack/.git/taid/config-history`). Submodule saves go into that same
+central store, not their own Git directories. Launching taid inside a folder of
+the checkout uses its discovered repository root; opening a submodule on its own
+instead gives it an independent history scope. Git-file/worktree checkouts use
+their actual administrative directory.
+Session envelopes/descriptions reside alongside it in `taid/config-sessions`,
+repository intents/outcomes in `taid/repository-history`, and multi-target restore
+plans/progress in `taid/config-restores`, all under the
+same opened checkout's Git administrative directory and never pushable.
+
+Existing per-submodule journals are imported automatically into the central
+catalogue when history is opened or the relevant config is opened. Originals are
+retained, verified snapshots and IDs are preserved, and repeated imports do not
+duplicate entries. Only initialized submodules can be scanned; `R` reloads after
+initialization. Failed imports are reported under `w`, without deleting records.
+
+History is not placed in the worktree or in Git objects, refs, commits,
+notes or the index. **Git push/clone does not transfer it.** This is global within
+the opened checkout, not across unrelated stacks or machines. History files/directories use owner-only
+permissions on Unix; Windows uses the checkout's existing filesystem ACLs.
+Moving/copying the whole Git metadata directory can of course copy the history;
+losing that directory loses the local history too.
+
+Saving first locks the per-file journal, writes and syncs the complete recovery
+record, then atomically replaces the YAML and finalizes the journal. History
+storage/locking failures prevent starting a save. File contents are synced on all
+platforms; directory entries are additionally synced on Unix. Durability still
+depends on the filesystem/hardware honoring those operations.
+
+On reopening the form or global history, interrupted saves are checked against the actual file:
+matching the after snapshot finalizes the history; matching before or neither
+retains an interrupted entry with an explicit warning. Recovery **never replaces
+the YAML automatically**. Incomplete/corrupt records remain visible, with corrupt
+restores blocked by integrity checks. A corrupt pending recovery record blocks
+new saves until its journal issue is resolved; healthy entries remain browsable.
+Two taid instances cannot write the same config concurrently through taid's
+journal. Non-cooperating external editors are checked before replacement, but
+cannot participate in that lock; no application can guarantee exclusion against
+an arbitrary external write racing the final filesystem operation.
+
+A session/action/file restore validates repository states and files before any write,
+takes a shared checkout lock as well as all affected
+per-file locks in deterministic order (including unchanged targets), rechecks
+the preview baselines, and syncs a complete multi-file before/after recovery
+plan before changing a checkout or replacing any YAML. Each repository action
+and changed file also uses its normal journal. Repository intents are synced
+before Git runs; an interrupted action remains visible with an unknown outcome,
+and its before snapshot can be reviewed without guessing an after state.
+Multi-target writes are **not one atomic filesystem operation**: a failure stops
+remaining writes and retains both the full plan and per-file completion markers.
+Opening history only reports observed disk states; it never automatically
+resumes or rolls back. Use `h` → `u` to review recovery, including files the
+interrupted write loop never reached. Plans are integrity-checked and retained
+after completion/resolution; no automatic pruning occurs. A recovery plan is
+limited to 32 MiB serialized (individual snapshots remain limited to 2 MiB);
+an oversized plan refuses to start writing.
+
 ### Remote updates and pulling
 
-taid does not fetch or pull at startup. A yellow `[new]`
+taid does not fetch or pull at startup. A yellow `[new: N]`
 badge indicates commits on the selected local branch or its fetched upstream
 that are missing from the current checkout. Badges reflect the latest successful
 fetch, including local branch commits when browsing an older detached commit.
@@ -176,6 +324,16 @@ They use locally stored references and cannot detect new remote commits until
 a confirmed pull (or a fetch performed outside taid) refreshes those references.
 When reopening a detached checkout, the branch is inferred only if exactly one
 local branch contains that commit. Otherwise select a branch with `b`.
+`[ahead: N]` means the local branch has commits absent from its stored upstream.
+`[diverged]` means both branches have unique commits, so a fast-forward is
+impossible. `[detached]`, `[branch ?]`, `[no upstream]` and `[unborn]`
+distinguish checkouts that cannot be pulled normally. The commit-pane summary
+shows exact ahead/behind counts and checkout-missing commits. Ahead/behind
+compare the selected local branch tip to its upstream; `[new: N]` compares the
+checkout to the union of that branch's and upstream's history. Divergence takes
+precedence over the new/ahead badge.
+Narrow list rows show the highest-priority state so module names remain readable;
+the summary explains additional states such as a detached checkout behind a branch.
 
 Press `Ctrl+P`, then `P` to open a confirmation popup. Press `Enter`/`y` or click
 **Pull** to fetch and fast-forward the main repository and every initialized
@@ -187,6 +345,14 @@ without overwriting files or creating merges. Apply or clear pending commit
 picks and close the config form before pulling. Wait for remote operations
 to finish before quitting. Pulls temporarily block changes to commits/config
 files.
+Press `Ctrl+X` during a remote operation to cancel an active fetch and skip
+remaining repositories. An already-started checkout is allowed to finish;
+successful earlier pulls are not rolled back. Commands have a 60-second deadline
+including output-pipe closure, bounded diagnostic capture and helper cleanup.
+Timeouts during checkout are reported as potentially partial: inspect `git status`
+before retrying; taid does not automatically reset the repository. Existing
+merge/rebase/cherry-pick operations are refused. Diagnostics redact URL credentials
+and remove terminal control characters.
 
 Pulling a submodule updates its working checkout; it does not stage its pointer
 in the main repository. Submodules are handled individually with recursive
@@ -217,7 +383,9 @@ the pull shortcut.
 | `Ctrl+Q` | Quit (protecting unsaved config changes) |
 | `/` (form) | Find parameters by name or comment |
 | `r` (form) | Reset the selected parameter to its last saved value |
-| `Ctrl+S` (form) | Validate and save parameter values |
+| `Ctrl+S` (form) | Validate and review parameter changes before saving |
+| `h` (repositories/configs/clean form) | Global sessions (repository actions + config saves); `Enter` expand, `Backspace` up, `/` search, `f` file/all, `n` description, `c` compare, `b` target, `r` review restore, `R` reload, `w` warnings, `u` recovery |
+| `Ctrl+X` | Cancel a fetch/skip remaining repositories; finish an active checkout |
 | `Esc` (form) | Cancel a value input/search or close a saved form |
 | `Ctrl+D` (form) | Discard unsaved parameter values and close |
 

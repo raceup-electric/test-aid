@@ -15,6 +15,7 @@ use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 use crate::app::ScrollState;
+use crate::history::{Change, Record, Store, Summary};
 
 static SAVE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -138,11 +139,41 @@ pub struct Form {
     pub filter: String,
     pub filtering: bool,
     pub notice: String,
+    pub overlay: Option<Overlay>,
+    history_root: Option<PathBuf>,
+    session: Option<String>,
+    restored_from: Option<String>,
     original: String,
+}
+
+pub enum Overlay {
+    Save {
+        changes: Vec<Change>,
+        note: String,
+        note_editing: bool,
+        scroll: usize,
+    },
+    History {
+        entries: Vec<Summary>,
+        scroll: ScrollState,
+        record: Option<Box<Record>>,
+        compare_current: bool,
+        before: bool,
+        diff_scroll: usize,
+        diff_focus: bool,
+    },
 }
 
 impl Form {
     pub fn open(path: PathBuf) -> Result<Self> {
+        Self::open_scoped(path, None)
+    }
+
+    pub fn open_in(path: PathBuf, root: &Path) -> Result<Self> {
+        Self::open_scoped(path, Some(root.canonicalize()?))
+    }
+
+    fn open_scoped(path: PathBuf, history_root: Option<PathBuf>) -> Result<Self> {
         if !matches!(
             path.extension().and_then(|s| s.to_str()),
             Some("yaml" | "yml")
@@ -155,6 +186,21 @@ impl Form {
         }
         let original = fs::read_to_string(&path).context("reading YAML configuration")?;
         let parameters = parameters(&original).context("parsing YAML configuration")?;
+        let notice = if git2::Repository::discover(path.parent().unwrap()).is_ok() {
+            let store = match &history_root {
+                Some(root) => Store::open_in(&path, root),
+                None => Store::open(&path),
+            };
+            match store.and_then(|s| s.recover(&path)) {
+                Ok(messages) if !messages.is_empty() => messages.join(" · "),
+                Err(e) => format!(
+                    "History recovery unavailable: {e:#}. Saves require healthy history storage."
+                ),
+                _ => "Choose a parameter; Enter edits its value or toggles a boolean".into(),
+            }
+        } else {
+            "Choose a parameter; Enter edits its value or toggles a boolean".into()
+        };
         let visible = (0..parameters.len()).collect();
         let scroll = ScrollState::new(parameters.len());
         Ok(Self {
@@ -165,9 +211,30 @@ impl Form {
             editing: None,
             filter: String::new(),
             filtering: false,
-            notice: "Choose a parameter; Enter edits its value or toggles a boolean".into(),
+            notice,
+            overlay: None,
+            history_root,
+            session: None,
+            restored_from: None,
             original,
         })
+    }
+
+    fn store(&self) -> Result<Store> {
+        Ok(match &self.history_root {
+            Some(root) => Store::open_in(&self.path, root),
+            None => Store::open(&self.path),
+        }?
+        .with_session(self.session.clone()))
+    }
+
+    pub(crate) fn set_session(&mut self, root: &Path, id: &str) {
+        self.history_root = Some(root.to_path_buf());
+        self.session = Some(id.into());
+    }
+
+    pub(crate) fn baseline(&self) -> &str {
+        &self.original
     }
 
     pub fn selected(&self) -> Option<&Parameter> {
@@ -254,7 +321,7 @@ impl Form {
         };
         p.value = value;
         self.editing = None;
-        self.notice = "Value updated · Ctrl+S writes changes to the YAML file".into();
+        self.notice = "Value updated · Ctrl+S reviews changes before saving".into();
         Ok(())
     }
 
@@ -317,6 +384,22 @@ impl Form {
     }
 
     pub fn paste(&mut self, text: &str) {
+        if let Some(Overlay::Save {
+            note,
+            note_editing: true,
+            ..
+        }) = &mut self.overlay
+        {
+            note.extend(
+                text.chars()
+                    .filter(|c| !c.is_control())
+                    .take(500usize.saturating_sub(note.chars().count())),
+            );
+            return;
+        }
+        if self.overlay.is_some() {
+            return;
+        }
         if let Some(input) = &mut self.editing {
             if text.contains(['\n', '\r']) {
                 self.notice = "Paste a single parameter value, not YAML".into();
@@ -341,6 +424,9 @@ impl Form {
             let span = p.span.clone().context("parameter is read-only")?;
             text.replace_range(span, &p.encoded());
         }
+        if text.len() > 2 * 1024 * 1024 {
+            bail!("saved YAML would exceed the 2 MiB configuration limit; nothing was saved");
+        }
         // Check every path, type and resulting value before touching the disk.
         let parsed = parameters(&text)?;
         if parsed.len() != self.parameters.len()
@@ -355,14 +441,372 @@ impl Form {
     }
 
     pub fn save(&mut self) -> Result<()> {
+        self.save_with_note("")
+    }
+
+    fn save_with_note(&mut self, note: &str) -> Result<()> {
         self.commit_input()?;
         let text = self.text()?;
-        atomic_save(&self.path, &self.original, &text)?;
+        if text == self.original {
+            self.notice = "No changes to save".into();
+            return Ok(());
+        }
+        let store = self.store()?;
+        self.notice = store.save(
+            &self.path,
+            &self.original,
+            &text,
+            self.changes(),
+            note,
+            self.restored_from.clone(),
+        )?;
         self.parameters = parameters(&text)?;
         self.original = text;
-        self.notice = "Saved parameter values to YAML file".into();
+        self.restored_from = None;
         Ok(())
     }
+
+    pub fn changes(&self) -> Vec<Change> {
+        self.parameters
+            .iter()
+            .filter(|p| p.changed())
+            .map(|p| Change {
+                name: p.name.clone(),
+                before: p.original_value.clone(),
+                after: p.value.clone(),
+            })
+            .collect()
+    }
+
+    pub fn request_save(&mut self) -> Result<()> {
+        self.commit_input()?;
+        self.text()?;
+        if !self.dirty() {
+            self.notice = "No changes to save".into();
+            return Ok(());
+        }
+        self.check_disk()?;
+        self.overlay = Some(Overlay::Save {
+            changes: self.changes(),
+            note: String::new(),
+            note_editing: false,
+            scroll: 0,
+        });
+        self.notice = "Review changes; Enter confirms, Esc returns to editing".into();
+        Ok(())
+    }
+
+    pub(crate) fn check_disk(&self) -> Result<()> {
+        if !fs::symlink_metadata(&self.path)?.is_file()
+            || fs::read_to_string(&self.path)? != self.original
+        {
+            bail!("config file changed on disk; close/reopen it before saving or restoring");
+        }
+        Ok(())
+    }
+
+    pub fn open_history(&mut self) -> Result<()> {
+        if self.dirty() {
+            bail!("Save or discard pending edits before opening History");
+        }
+        self.check_disk()?;
+        let store = self.store()?;
+        let mut messages = match store.recover(&self.path) {
+            Ok(m) => m,
+            Err(e) => vec![format!("Recovery needs attention: {e:#}")],
+        };
+        let entries = store.list()?;
+        let record = match entries.first().map(|s| store.load(s)).transpose() {
+            Ok(r) => r.map(Box::new),
+            Err(e) => {
+                messages.push(format!("Selected entry cannot be restored: {e:#}"));
+                None
+            }
+        };
+        let scroll = ScrollState::new(entries.len());
+        self.overlay = Some(Overlay::History {
+            entries,
+            scroll,
+            record,
+            compare_current: false,
+            before: false,
+            diff_scroll: 0,
+            diff_focus: false,
+        });
+        self.notice = messages.join(" · ");
+        Ok(())
+    }
+
+    pub fn select_history(&mut self, idx: usize) -> Result<()> {
+        if let Some(Overlay::History {
+            entries,
+            scroll,
+            record,
+            diff_scroll,
+            diff_focus,
+            ..
+        }) = &mut self.overlay
+        {
+            scroll.select(idx);
+            *record = None;
+            *diff_scroll = 0;
+            *diff_focus = false;
+            *record = entries
+                .get(scroll.selected())
+                .map(|s| match &self.history_root {
+                    Some(root) => Store::open_in(&self.path, root)?.load(s),
+                    None => Store::open(&self.path)?.load(s),
+                })
+                .transpose()?
+                .map(Box::new);
+        }
+        Ok(())
+    }
+
+    pub fn history_comparison(&self) -> Result<Vec<Change>> {
+        let Some(Overlay::History {
+            record: Some(record),
+            compare_current,
+            before,
+            ..
+        }) = &self.overlay
+        else {
+            return Ok(Vec::new());
+        };
+        if !compare_current {
+            return Ok(record.changes.clone());
+        }
+        let target = if *before {
+            &record.before
+        } else {
+            &record.after
+        };
+        compare(&self.original, target)
+    }
+
+    pub(crate) fn restore(&mut self, text: &str, source: String) -> Result<()> {
+        if self.dirty() {
+            bail!("Save or discard edits before restoring");
+        }
+        self.check_disk()?;
+        let target = parameters(text)?;
+        let mut incompatible = Vec::new();
+        for p in &self.parameters {
+            match target.iter().find(|old| old.path == p.path) {
+                None => incompatible.push(format!("{} missing in snapshot", p.name)),
+                Some(old) if old.kind != p.kind => incompatible.push(format!(
+                    "{}: {} → {}",
+                    p.name,
+                    old.kind.label(),
+                    p.kind.label()
+                )),
+                _ => {}
+            }
+        }
+        for old in &target {
+            if !self.parameters.iter().any(|p| p.path == old.path) {
+                incompatible.push(format!("{} absent from current schema", old.name));
+            }
+        }
+        if !incompatible.is_empty() {
+            bail!(
+                "Historical schema is incompatible (keys, types or array lengths differ): {}. No values were loaded; c shows the complete comparison",
+                incompatible
+                    .iter()
+                    .take(8)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            );
+        }
+        if self.parameters.iter().any(|p| {
+            p.readonly.is_some()
+                && target
+                    .iter()
+                    .find(|old| old.path == p.path)
+                    .is_some_and(|old| old.value != p.value)
+        }) {
+            bail!("Historical version changes read-only parameters; no values were loaded");
+        }
+        for p in &mut self.parameters {
+            p.value = target
+                .iter()
+                .find(|old| old.path == p.path)
+                .unwrap()
+                .value
+                .clone();
+        }
+        self.restored_from = Some(source);
+        self.notice =
+            "Historical values loaded as pending edits · Ctrl+S reviews and records the restore"
+                .into();
+        Ok(())
+    }
+
+    /// Modal input returns true only when a config save succeeded.
+    pub fn overlay_key(&mut self, code: KeyCode, modifiers: KeyModifiers, page: usize) -> bool {
+        let Some(mut overlay) = self.overlay.take() else {
+            return false;
+        };
+        let mut close = false;
+        let mut saved = false;
+        match &mut overlay {
+            Overlay::Save {
+                changes,
+                note,
+                note_editing,
+                scroll,
+            } => {
+                if *note_editing {
+                    match code {
+                        KeyCode::Enter | KeyCode::Esc => *note_editing = false,
+                        KeyCode::Backspace => {
+                            note.pop();
+                        }
+                        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+                            note.clear()
+                        }
+                        KeyCode::Char(c)
+                            if !c.is_control()
+                                && !modifiers
+                                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                                && note.chars().count() < 500 =>
+                        {
+                            note.push(c)
+                        }
+                        _ => {}
+                    }
+                } else {
+                    match code {
+                        KeyCode::Enter => match self.save_with_note(note) {
+                            Ok(()) => {
+                                close = true;
+                                saved = true;
+                            }
+                            Err(e) => self.notice = format!("{e:#}"),
+                        },
+                        KeyCode::Esc | KeyCode::Char('q') => close = true,
+                        KeyCode::Char('n') => *note_editing = true,
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            *scroll = (*scroll + 1).min(changes.len().saturating_sub(1))
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => *scroll = scroll.saturating_sub(1),
+                        KeyCode::PageDown => {
+                            *scroll = (*scroll + page.max(1)).min(changes.len().saturating_sub(1))
+                        }
+                        KeyCode::PageUp => *scroll = scroll.saturating_sub(page.max(1)),
+                        KeyCode::Home => *scroll = 0,
+                        KeyCode::End => *scroll = changes.len().saturating_sub(1),
+                        _ => {}
+                    }
+                }
+            }
+            Overlay::History {
+                entries,
+                scroll,
+                record,
+                compare_current,
+                before,
+                diff_scroll,
+                diff_focus,
+            } => {
+                let previous = scroll.selected();
+                match code {
+                    KeyCode::Esc | KeyCode::Char('q') => close = true,
+                    KeyCode::Tab | KeyCode::BackTab => *diff_focus = !*diff_focus,
+                    KeyCode::Char('c') => {
+                        *compare_current = !*compare_current;
+                        *diff_scroll = 0;
+                    }
+                    KeyCode::Char('b') => {
+                        *before = !*before;
+                        *diff_scroll = 0;
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(r) = record {
+                            match self.restore(
+                                if *before { &r.before } else { &r.after },
+                                format!("{}:{}", r.id, if *before { "before" } else { "after" }),
+                            ) {
+                                Ok(()) => close = true,
+                                Err(e) => self.notice = format!("{e:#}"),
+                            }
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') if *diff_focus => {
+                        *diff_scroll = diff_scroll.saturating_add(1)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') if *diff_focus => {
+                        *diff_scroll = diff_scroll.saturating_sub(1)
+                    }
+                    KeyCode::PageDown if *diff_focus => {
+                        *diff_scroll = diff_scroll.saturating_add(page.max(1))
+                    }
+                    KeyCode::PageUp if *diff_focus => {
+                        *diff_scroll = diff_scroll.saturating_sub(page.max(1))
+                    }
+                    KeyCode::Home if *diff_focus => *diff_scroll = 0,
+                    KeyCode::End if *diff_focus => *diff_scroll = usize::MAX,
+                    KeyCode::Down | KeyCode::Char('j') => scroll.move_by(1),
+                    KeyCode::Up | KeyCode::Char('k') => scroll.move_by(-1),
+                    KeyCode::PageDown => scroll.page_by(page, 1),
+                    KeyCode::PageUp => scroll.page_by(page, -1),
+                    KeyCode::Home => scroll.first(),
+                    KeyCode::End => scroll.last(),
+                    _ => {}
+                }
+                if previous != scroll.selected() {
+                    *diff_scroll = 0;
+                    match entries
+                        .get(scroll.selected())
+                        .map(|s| match &self.history_root {
+                            Some(root) => Store::open_in(&self.path, root)?.load(s),
+                            None => Store::open(&self.path)?.load(s),
+                        })
+                        .transpose()
+                    {
+                        Ok(r) => *record = r.map(Box::new),
+                        Err(e) => {
+                            *record = None;
+                            self.notice = format!("{e:#}");
+                        }
+                    }
+                }
+            }
+        }
+        if !close {
+            self.overlay = Some(overlay);
+        }
+        saved
+    }
+}
+
+pub fn compare(before: &str, after: &str) -> Result<Vec<Change>> {
+    let a = parameters(before)?;
+    let b = parameters(after)?;
+    let mut result = Vec::new();
+    for p in &a {
+        let other = b.iter().find(|q| q.path == p.path);
+        if other.is_none_or(|q| q.kind != p.kind || q.value != p.value) {
+            result.push(Change {
+                name: p.name.clone(),
+                before: format!("{} ({})", p.value, p.kind.label()),
+                after: other
+                    .map(|q| format!("{} ({})", q.value, q.kind.label()))
+                    .unwrap_or_else(|| "<missing>".into()),
+            });
+        }
+    }
+    for p in &b {
+        if !a.iter().any(|q| q.path == p.path) {
+            result.push(Change {
+                name: p.name.clone(),
+                before: "<missing>".into(),
+                after: format!("{} ({})", p.value, p.kind.label()),
+            });
+        }
+    }
+    Ok(result)
 }
 
 fn byte_at(text: &str, col: usize) -> usize {
@@ -746,7 +1190,7 @@ fn description(text: &str, start: usize, end: Option<usize>) -> String {
     comments.join(" ")
 }
 
-fn atomic_save(path: &Path, original: &str, text: &str) -> Result<()> {
+pub(crate) fn atomic_save(path: &Path, original: &str, text: &str) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() {
         bail!("config file was replaced; reopen it before saving");
@@ -773,13 +1217,14 @@ fn atomic_save(path: &Path, original: &str, text: &str) -> Result<()> {
     };
     let result = (|| -> Result<()> {
         file.write_all(text.as_bytes())?;
-        file.sync_all()?;
         fs::set_permissions(&temporary, metadata.permissions())?;
+        file.sync_all()?;
         drop(file);
         if !fs::symlink_metadata(path)?.is_file() || fs::read_to_string(path)? != original {
             bail!("config file changed on disk; reopen it before saving");
         }
         fs::rename(&temporary, path)?;
+        crate::history::sync_dir(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -796,6 +1241,7 @@ mod tests {
 
     fn form(tag: &str, yaml: &str) -> Result<(TempDir, Form)> {
         let temp = TempDir::new(tag)?;
+        git2::Repository::init(temp.path())?;
         let path = temp.path().join("params.yaml");
         fs::write(&path, yaml)?;
         let form = Form::open(path)?;
@@ -973,6 +1419,138 @@ mod tests {
         f.paste("1.5");
         f.key(KeyCode::Esc, KeyModifiers::NONE, 10);
         assert_eq!(f.text()?, "speed: 1.0\n# steering limits\nangle: 0.5\n");
+        Ok(())
+    }
+
+    #[test]
+    fn save_review_notes_persistent_history_and_restore_are_append_only() -> Result<()> {
+        let (_temp, mut f) = form("history-workflow", "# keep this\ngain: 1\n")?;
+        f.activate();
+        f.paste("2");
+        f.commit_input()?;
+        f.request_save()?;
+        assert_eq!(fs::read_to_string(&f.path)?, "# keep this\ngain: 1\n");
+        assert_eq!(f.changes()[0].before, "1");
+        assert_eq!(f.changes()[0].after, "2");
+        f.overlay_key(KeyCode::Esc, KeyModifiers::NONE, 10);
+        assert!(f.dirty());
+        f.request_save()?;
+        f.overlay_key(KeyCode::Char('n'), KeyModifiers::NONE, 10);
+        f.paste("Skidpad tuning λ");
+        f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10); // finish note
+        assert!(f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert!(!f.dirty());
+        let store = Store::open(&f.path)?;
+        assert_eq!(store.list()?[0].note, "Skidpad tuning λ");
+        let path = f.path.clone();
+        drop(f);
+        let mut f = Form::open(path)?;
+        f.activate();
+        f.paste("3");
+        f.save()?;
+        f.open_history()?;
+        assert_eq!(f.history_comparison()?[0].before, "2");
+        f.overlay_key(KeyCode::Up, KeyModifiers::NONE, 10);
+        f.select_history(1)?; // earliest save (1 → 2)
+        f.overlay_key(KeyCode::Char('c'), KeyModifiers::NONE, 10);
+        let compare = f.history_comparison()?;
+        assert!(compare[0].before.starts_with('3'));
+        assert!(compare[0].after.starts_with('2'));
+        f.overlay_key(KeyCode::Char('b'), KeyModifiers::NONE, 10); // baseline before first save
+        f.overlay_key(KeyCode::Char('r'), KeyModifiers::NONE, 10);
+        assert!(f.overlay.is_none());
+        assert!(f.dirty());
+        assert_eq!(
+            fs::read_to_string(&f.path)?,
+            "# keep this\ngain: 3\n",
+            "restore is only pending"
+        );
+        f.request_save()?;
+        assert!(f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert_eq!(fs::read_to_string(&f.path)?, "# keep this\ngain: 1\n");
+        let entries = store.list()?;
+        assert_eq!(entries.len(), 3);
+        let restore = store.load(&entries[0])?;
+        assert!(
+            restore
+                .restored_from
+                .as_deref()
+                .unwrap()
+                .ends_with(":before")
+        );
+        assert_eq!(restore.before, "# keep this\ngain: 3\n");
+        f.open_history()?;
+        f.overlay_key(KeyCode::Char('b'), KeyModifiers::NONE, 10);
+        f.overlay_key(KeyCode::Char('r'), KeyModifiers::NONE, 10); // undo the restore
+        f.request_save()?;
+        f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10);
+        assert_eq!(fs::read_to_string(&f.path)?, "# keep this\ngain: 3\n");
+        assert_eq!(store.list()?.len(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn history_restore_blocks_schema_drift_readonly_changes_and_external_edits() -> Result<()> {
+        let (_temp, mut f) = form("history-drift", "gain: 1\n")?;
+        f.activate();
+        f.paste("2");
+        f.save()?;
+        fs::write(&f.path, "gain: 2\nnew_param: true\n")?;
+        let mut f = Form::open(f.path)?;
+        f.open_history()?;
+        f.overlay_key(KeyCode::Char('c'), KeyModifiers::NONE, 10);
+        assert!(
+            f.history_comparison()?
+                .iter()
+                .any(|c| c.name == "new_param" && c.after == "<missing>")
+        );
+        f.overlay_key(KeyCode::Char('r'), KeyModifiers::NONE, 10);
+        assert!(f.overlay.is_some());
+        assert!(!f.dirty());
+        assert!(f.notice.contains("incompatible"));
+        assert!(
+            f.restore("gain: 1.0\nnew_param: true\n", "old".into())
+                .is_err()
+        );
+        assert!(
+            f.restore("gain: 1\nnew_param: true\narray: [1, 2]\n", "old".into())
+                .is_err()
+        );
+        fs::write(&f.path, "gain: 99\nnew_param: true\n")?;
+        f.overlay_key(KeyCode::Char('r'), KeyModifiers::NONE, 10);
+        assert!(f.notice.contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&f.path)?, "gain: 99\nnew_param: true\n");
+        let (_temp, mut readonly) = form("history-readonly", "shared: &x 1\ncopy: *x\n")?;
+        assert!(
+            readonly
+                .restore("shared: &x 2\ncopy: *x\n", "old".into())
+                .is_err()
+        );
+        assert!(!readonly.dirty());
+        Ok(())
+    }
+
+    #[test]
+    fn history_and_review_do_not_accept_unvalidated_pastes_or_overwrite_dirty_edits() -> Result<()>
+    {
+        let (_temp, mut f) = form("history-modal", "gain: 1\n")?;
+        f.activate();
+        f.paste("not numeric");
+        assert!(f.request_save().is_err());
+        assert!(f.overlay.is_none());
+        assert!(f.open_history().is_err());
+        f.key(KeyCode::Esc, KeyModifiers::NONE, 10);
+        f.activate();
+        f.paste("2");
+        f.commit_input()?;
+        assert!(f.open_history().is_err());
+        f.request_save()?;
+        f.paste("gain: 200\nnew: false");
+        assert_eq!(f.changes()[0].after, "2");
+        fs::write(&f.path, "gain: 9\n")?;
+        assert!(!f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert!(f.overlay.is_some());
+        assert_eq!(fs::read_to_string(&f.path)?, "gain: 9\n");
         Ok(())
     }
 }

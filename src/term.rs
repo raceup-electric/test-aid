@@ -19,7 +19,13 @@ pub type Tui = Terminal<CrosstermBackend<Stdout>>;
 /// (default) hook so panics still print their message readably.
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
+    let ui_thread = std::thread::current().id();
     std::panic::set_hook(Box::new(move |info| {
+        // Background operations catch/report their failures through the UI.
+        // A caught worker panic must not reset raw mode or print over the TUI.
+        if std::thread::current().id() != ui_thread {
+            return;
+        }
         // Best effort: leave raw mode and the alternate screen first.
         let _ = disable_raw_mode();
         let _ = execute!(

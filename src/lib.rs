@@ -18,7 +18,10 @@ pub mod config;
 pub mod event;
 pub mod gitops;
 pub mod gitx;
+pub mod history;
 pub mod network;
+pub mod repository_history;
+pub mod session;
 pub mod term;
 
 mod ui;

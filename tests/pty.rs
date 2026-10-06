@@ -228,6 +228,159 @@ fn startup_and_cancelled_pull_never_invoke_git() -> TestResult {
 }
 
 #[test]
+fn config_history_survives_restart_and_restore_requires_confirmation() -> TestResult {
+    let (_temp, root) = super_repo("pty-config-history")?;
+    let path = root.join("subA/config/params.yaml");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, "gain: 1\n")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    session.send("\u{3}c\t\r\r2\r\u{13}nTuning\r\r\u{11}")?;
+    let (status, _) = session.finish();
+    assert!(status.expect("first session exits").success());
+    assert_eq!(std::fs::read_to_string(&path)?, "gain: 2\n");
+    assert_eq!(
+        taid::history::Store::open_in(&path, &root)?.list()?[0].note,
+        "Tuning"
+    );
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Global history opens directly from the default repository view, without
+    // first locating the submodule or opening its config form.
+    session.send("h\r\rcbr\u{13}\r\u{11}")?;
+    let (status, raw) = session.finish();
+    assert!(status.expect("restored session exits").success());
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(screen.contains("Historical values loaded"), "{screen}");
+    assert!(screen.contains("Review config save"), "{screen}");
+    assert_eq!(std::fs::read_to_string(&path)?, "gain: 1\n");
+    assert_eq!(
+        taid::history::Store::open_in(&path, &root)?.list()?.len(),
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn session_groups_multiple_config_saves_and_restores_the_whole_session_after_restart() -> TestResult
+{
+    let (_temp, root) = super_repo("pty-session-history")?;
+    let first = root.join("subA/config/a.yaml");
+    let second = root.join("subA/config/b.yaml");
+    std::fs::create_dir_all(first.parent().unwrap())?;
+    std::fs::write(&first, "gain: 1\n")?;
+    std::fs::write(&second, "gain: 1\n")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Two saves to a.yaml, one to b.yaml, all in the same process/session.
+    session.send("\u{3}c\t\r\r2\r\u{13}\r\r3\r\u{13}\r\u{12}r\u{3}c\tj\r\r4\r\u{13}\r\u{12}rhnDry track tuning\r\u{11}")?;
+    let (status, raw) = session.finish();
+    assert!(
+        status.expect("save session exits").success(),
+        "{}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert_eq!(std::fs::read_to_string(&first)?, "gain: 3\n");
+    assert_eq!(std::fs::read_to_string(&second)?, "gain: 4\n");
+    let browser = taid::history::Browser::open(&root)?;
+    assert_eq!(browser.entries.len(), 3);
+    assert_eq!(browser.visible.len(), 1);
+    assert!(browser.selected_label().contains("closed"));
+    assert!(browser.selected_label().contains("Dry track tuning"));
+    assert_eq!(browser.targets()?.len(), 2);
+    let original_id = browser.entries[0].session.clone().unwrap();
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Root session row: b chooses its baseline, r opens the ALL-file review.
+    session.send("hcbrnUndo dry tuning\r\r\r\u{11}")?;
+    let (status, raw) = session.finish();
+    assert!(status.expect("restore session exits").success());
+    let screen = String::from_utf8_lossy(&raw);
+    // Incremental ANSI repainting can split title words; rendering unit tests
+    // check the full title while this test checks real persisted outcomes.
+    assert!(screen.contains("Confirm ALL"), "{screen}");
+    assert_eq!(std::fs::read_to_string(&first)?, "gain: 1\n");
+    assert_eq!(std::fs::read_to_string(&second)?, "gain: 1\n");
+    let browser = taid::history::Browser::open(&root)?;
+    assert_eq!(browser.visible.len(), 2);
+    assert_eq!(browser.entries.len(), 5);
+    assert_ne!(
+        browser.entries[0].session.as_deref(),
+        Some(original_id.as_str())
+    );
+    assert_eq!(browser.entries[0].note, "Undo dry tuning");
+    assert!(taid::session::recoveries(&root)?.0.is_empty());
+    Ok(())
+}
+
+#[test]
+fn killing_taid_retains_immediate_saves_and_marks_the_session_interrupted() -> TestResult {
+    let (_temp, root) = super_repo("pty-session-crash")?;
+    let path = root.join("subA/config/gains.yaml");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, "gain: 1\n")?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    session.send("\u{3}c\t\r\r2\r\u{13}\r")?;
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    while std::fs::read_to_string(&path)? != "gain: 2\n" {
+        assert!(Instant::now() < deadline, "save never reached disk");
+        std::thread::sleep(POLL);
+    }
+    session.child.kill()?;
+    let (status, _) = session.finish();
+    assert!(!status.expect("killed child exits").success());
+    let browser = taid::history::Browser::open(&root)?;
+    assert_eq!(browser.visible.len(), 1);
+    assert_eq!(browser.entries.len(), 1);
+    assert!(browser.selected_label().contains("interrupted"));
+    assert_eq!(browser.targets()?[0].before, "gain: 1\n");
+    assert_eq!(browser.targets()?[0].after, "gain: 2\n");
+    assert_eq!(
+        std::fs::read_to_string(&path)?,
+        "gain: 2\n",
+        "opening interrupted history never rolls it back automatically"
+    );
+    Ok(())
+}
+
+#[test]
+fn branch_only_history_survives_restart_and_reviews_restore_in_real_terminal() -> TestResult {
+    let (_temp, root) = super_repo("pty-repository-history")?;
+    let repo = git2::Repository::open(&root)?;
+    repo.branch("feature", &repo.head()?.peel_to_commit()?, false)?;
+    let mut first = PtySession::spawn(&root, None)?;
+    first.wait_until_started()?;
+    first.send("b\rh\u{11}")?;
+    let (status, raw) = first.finish();
+    assert!(status.expect("first session exits").success());
+    assert!(
+        String::from_utf8_lossy(&raw).contains("session history"),
+        "{}",
+        String::from_utf8_lossy(&raw)
+    );
+    assert_eq!(repo.head()?.shorthand(), Some("feature"));
+    let records = taid::repository_history::events(&root)?.0;
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        taid::session::info(&root, &records[0].intent.session)?.state,
+        "closed"
+    );
+    let mut second = PtySession::spawn(&root, None)?;
+    second.wait_until_started()?;
+    // Expand the session, select before, review the action, explicitly confirm.
+    second.send("h\rbr\r\u{11}")?;
+    let (status, _raw) = second.finish();
+    assert!(status.expect("restoring session exits").success());
+    assert_eq!(repo.head()?.shorthand(), Some("main"));
+    let records = taid::repository_history::events(&root)?.0;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].intent.kind, "restore repository");
+    assert_ne!(records[0].intent.session, records[1].intent.session);
+    Ok(())
+}
+
+#[test]
 fn outside_a_repo_shows_popup_and_ok_exits() -> TestResult {
     let temp = TempDir::new("pty-notrepo")?;
     let mut session = PtySession::spawn(temp.path(), None)?;
@@ -473,8 +626,8 @@ fn config_chord_edits_and_saves_a_real_file() -> TestResult {
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
     // Ctrl+C, C → configs; Tab/Enter → form; Enter/2/Enter → typed value;
-    // Ctrl+S → disk; Esc → files; Ctrl+R, R → repositories; q → exit.
-    session.send("\u{3}c\t\r\r2\r\u{13}\u{1b}\u{12}rq")?;
+    // Ctrl+S/Enter → review/confirm; Esc → files; Ctrl+R, R → repositories; q → exit.
+    session.send("\u{3}c\t\r\r2\r\u{13}\r\u{1b}\u{12}rq")?;
     let (status, raw) = session.finish();
     assert!(
         status.expect("config workflow should exit").success(),

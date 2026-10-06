@@ -112,14 +112,112 @@ pub struct UpdateInfo {
     /// are missing from the checkout. Divergence also counts as new commits.
     pub newer: usize,
     pub has_upstream: bool,
+    pub ahead: usize,
+    pub behind: usize,
+    pub detached: bool,
+    pub unknown: bool,
+    pub unborn: bool,
+}
+
+impl UpdateInfo {
+    /// One concise state for narrow list rows; the summary retains all details.
+    pub fn row_badge(&self) -> String {
+        if self.unborn {
+            "[unborn]".into()
+        } else if self.unknown {
+            "[branch ?]".into()
+        } else if self.ahead > 0 && self.behind > 0 {
+            "[diverged]".into()
+        } else if self.newer > 0 {
+            format!("[new: {}]", self.newer)
+        } else if self.ahead > 0 {
+            format!("[ahead: {}]", self.ahead)
+        } else if self.detached {
+            "[detached]".into()
+        } else if !self.has_upstream {
+            "[no upstream]".into()
+        } else {
+            String::new()
+        }
+    }
+
+    pub fn badge(&self) -> String {
+        let mut badges = Vec::new();
+        if self.unborn {
+            return "[unborn]".into();
+        }
+        if self.unknown {
+            return "[detached] [branch unknown]".into();
+        }
+        if self.ahead > 0 && self.behind > 0 {
+            badges.push("[diverged]".into());
+        } else if self.newer > 0 {
+            badges.push(format!("[new: {}]", self.newer));
+        } else if self.ahead > 0 {
+            badges.push(format!("[ahead: {}]", self.ahead));
+        }
+        if self.detached {
+            badges.push("[detached]".into());
+        }
+        if !self.has_upstream && !self.detached {
+            badges.push("[no upstream]".into());
+        }
+        badges.join(" ")
+    }
+
+    pub fn detail(&self) -> String {
+        if self.unborn {
+            return "branch has no commits yet".into();
+        }
+        if self.unknown {
+            return "detached HEAD; branch is ambiguous/unknown — select one with b".into();
+        }
+        format!(
+            "{} · {} commit(s) missing from checkout · upstream {}{}{}",
+            self.branch,
+            self.newer,
+            if self.has_upstream {
+                format!("+{} ahead / -{} behind", self.ahead, self.behind)
+            } else {
+                "not configured".into()
+            },
+            if self.ahead > 0 && self.behind > 0 {
+                " · diverged: fast-forward pull is impossible"
+            } else {
+                ""
+            },
+            if self.detached {
+                " · detached: select a branch before pulling"
+            } else {
+                ""
+            }
+        )
+    }
 }
 
 pub fn update_info(repo: &Repository, selected: Option<&str>) -> Option<UpdateInfo> {
-    let name = selected_branch(repo, selected)?;
+    let info = head_info(repo).ok()?;
+    let detached = matches!(info, HeadInfo::Detached(_));
+    let unborn = matches!(info, HeadInfo::Unborn(_));
+    let Some(name) = selected_branch(repo, selected) else {
+        return Some(UpdateInfo {
+            branch: String::new(),
+            newer: 0,
+            has_upstream: false,
+            ahead: 0,
+            behind: 0,
+            detached,
+            unknown: !unborn,
+            unborn,
+        });
+    };
     let branch = repo.find_branch(&name, git2::BranchType::Local).ok()?;
     let head = repo.head().ok()?.target()?;
     let tip = branch.get().target()?;
     let upstream = branch.upstream().ok().and_then(|b| b.get().target());
+    let (ahead, behind) = upstream
+        .and_then(|oid| repo.graph_ahead_behind(tip, oid).ok())
+        .unwrap_or((0, 0));
     let mut walk = repo.revwalk().ok()?;
     walk.push(tip).ok()?;
     if let Some(upstream) = upstream {
@@ -133,6 +231,11 @@ pub fn update_info(repo: &Repository, selected: Option<&str>) -> Option<UpdateIn
         branch: name,
         newer,
         has_upstream: upstream.is_some(),
+        ahead,
+        behind,
+        detached,
+        unknown: false,
+        unborn: false,
     })
 }
 
@@ -615,6 +718,63 @@ mod tests {
         let fresh = fixture::init_repo(&temp.path().join("fresh"), "main")?;
         assert!(history_tips(&fresh).is_empty());
         assert!(CommitLog::load_from(&fresh, &[])?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn branch_states_distinguish_ahead_behind_diverged_and_no_upstream() -> Result<()> {
+        let temp = TempDir::new("branch-states")?;
+        let (repo, oids) = fixture::make_history(&temp.path().join("repo"), &["base", "local"])?;
+        let no_upstream = update_info(&repo, None).unwrap();
+        assert!(no_upstream.badge().contains("no upstream"));
+        repo.remote("origin", "https://example.invalid/repo")?;
+        repo.reference("refs/remotes/origin/main", oids[0], true, "test")?;
+        repo.find_branch("main", git2::BranchType::Local)?
+            .set_upstream(Some("origin/main"))?;
+        let ahead = update_info(&repo, None).unwrap();
+        assert_eq!((ahead.ahead, ahead.behind, ahead.newer), (1, 0, 0));
+        assert!(ahead.badge().contains("ahead: 1"));
+        repo.set_head_detached(oids[0])?;
+        let pinned = update_info(&repo, Some("main")).unwrap();
+        assert!(pinned.detached);
+        assert_eq!(pinned.newer, 1);
+        assert!(pinned.badge().contains("new: 1"));
+        repo.set_head("refs/heads/main")?;
+        let base = repo.find_commit(oids[0])?;
+        let tree = base.tree()?;
+        let sig = fixture::sig_at(fixture::BASE_TIME + 123)?;
+        let remote = repo.commit(None, &sig, &sig, "remote side", &tree, &[&base])?;
+        repo.reference("refs/remotes/origin/main", remote, true, "test")?;
+        let diverged = update_info(&repo, None).unwrap();
+        assert_eq!((diverged.ahead, diverged.behind), (1, 1));
+        assert!(diverged.badge().contains("diverged"));
+        assert!(
+            diverged
+                .detail()
+                .contains("fast-forward pull is impossible")
+        );
+        repo.reference("refs/heads/main", oids[0], true, "test")?;
+        let behind = update_info(&repo, None).unwrap();
+        assert_eq!((behind.ahead, behind.behind), (0, 1));
+        assert!(behind.badge().contains("new: 1"));
+        Ok(())
+    }
+
+    #[test]
+    fn detached_unknown_and_unborn_states_do_not_guess_a_branch() -> Result<()> {
+        let temp = TempDir::new("branch-unknown")?;
+        let (repo, oids) = fixture::make_history(&temp.path().join("repo"), &["one", "two"])?;
+        repo.branch("another", &repo.find_commit(oids[0])?, false)?;
+        repo.set_head_detached(oids[0])?;
+        let state = update_info(&repo, None).unwrap();
+        assert!(state.unknown && state.detached);
+        assert!(state.badge().contains("branch unknown"));
+        assert_eq!(state.newer, 0);
+        let selected = update_info(&repo, Some("main")).unwrap();
+        assert!(!selected.unknown);
+        assert_eq!(selected.newer, 1);
+        let fresh = fixture::init_repo(&temp.path().join("empty"), "main")?;
+        assert!(update_info(&fresh, None).unwrap().unborn);
         Ok(())
     }
 }

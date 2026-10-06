@@ -120,7 +120,8 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
 fn draw_normal(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let footer = footer_lines(app, area.width as usize);
-    let footer_height = (footer.len() as u16).min(area.height.saturating_sub(4));
+    // Keep room for a summary and at least one commit on compact terminals.
+    let footer_height = (footer.len() as u16).min(area.height.saturating_sub(7));
     let rows = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(1),
@@ -131,13 +132,16 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
     draw_header(f, app, rows[0]);
     draw_footer(f, app, rows[3]);
     let status = app.shortcut_hint().unwrap_or_else(|| {
+        if let Some(browser) = &app.global_history {
+            return browser.notice.clone();
+        }
         app.form
             .as_ref()
             .map(|e| e.notice.clone())
             .unwrap_or_else(|| app.status.clone())
     });
     f.render_widget(
-        Paragraph::new(ellipsize(&status, rows[2].width as usize)).fg(CURRENT),
+        Paragraph::new(ellipsize(&safe_text(&status), rows[2].width as usize)).fg(CURRENT),
         rows[2],
     );
 
@@ -165,6 +169,12 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
     }
     if app.save_popup.is_some() {
         draw_save_popup(f, app);
+    }
+    if app.global_history.is_some() {
+        draw_global_history(f, app, rows[1]);
+    }
+    if app.batch_review.is_some() {
+        draw_batch_review(f, app, rows[1]);
     }
 }
 
@@ -214,7 +224,47 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn footer_lines(app: &App, width: usize) -> Vec<String> {
-    let global = "Views: Ctrl+R,R repositories · Ctrl+C,C configs · Ctrl+P,P confirm pull";
+    if let Some(review) = &app.batch_review {
+        return wrap_footer(
+            &[
+                if review.note_editing {
+                    "Restore note: type/paste · Backspace · Ctrl+U clear · Enter/Esc finish"
+                } else if review.outcome.is_some() {
+                    "Enter/Esc/q close result · snapshots retained in local history"
+                } else {
+                    "Enter confirm ALL displayed files · n note · Esc/q cancel without writing"
+                }
+                .into(),
+                "↑↓/kj · PgUp/PgDn · Home/End scroll review · Ctrl+Q quit".into(),
+            ],
+            width,
+        );
+    }
+    if let Some(browser) = &app.global_history {
+        let groups = if let Some(input) = &browser.description_input {
+            vec![format!(
+                "Session description: {input}▌ · Enter save · Esc cancel · Backspace · Ctrl+U clear"
+            )]
+        } else if browser.filtering {
+            vec![format!(
+                "Find: /{}▌ · Enter keep · Esc clear · Backspace remove · Ctrl+U clear",
+                browser.filter
+            )]
+        } else {
+            vec![
+                "Enter expand · Backspace up · ↑↓/kj/PgUp/PgDn/Home/End · Tab list/diff".into(),
+                "/ find · f file/all · n description · R reload · w warnings · u recovery".into(),
+                "c current diff · b before/after · r WHOLE row restore · h/Esc/q close".into(),
+                "Ctrl+Q quit · Ctrl+R,R repos · Ctrl+C,C configs · Ctrl+P,P pull".into(),
+            ]
+        };
+        return wrap_footer(&groups, width);
+    }
+    let global = if app.network_job.is_some() {
+        "Ctrl+X cancel remote operation · Views: Ctrl+R,R repositories · Ctrl+C,C configs"
+    } else {
+        "Views: Ctrl+R,R repositories · Ctrl+C,C configs · Ctrl+P,P confirm pull"
+    };
     let groups: Vec<String> = if app.popup == Some(Popup::PullConfirm) {
         vec![
             "Enter/y pull all · Esc/q/n cancel · click Pull/Cancel · Ctrl+Q quit".into(),
@@ -243,6 +293,20 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
             global.into(),
         ]
     } else if let Some(form) = &app.form {
+        if let Some(overlay) = &form.overlay {
+            let text = match overlay {
+                crate::config::Overlay::Save {
+                    note_editing: true, ..
+                } => "Note: type/paste · Ctrl+U clear · Enter/Esc finish note",
+                crate::config::Overlay::Save { .. } => {
+                    "Enter confirm save · Esc/q return to edits · n optional note · ↑↓/PgUp/PgDn scroll"
+                }
+                crate::config::Overlay::History { .. } => {
+                    "History: ↑↓/PgUp/PgDn/Home/End · Tab entries/diff · c compare · b before/after · r load restore · Esc/q close"
+                }
+            };
+            return wrap_footer(&[text.into(), "Ctrl+Q quit".into()], width);
+        }
         let mut lines = if form.editing.is_some() {
             vec![
                 "Value: type/paste replaces · ←→/Home/End cursor · Ctrl+U clear".into(),
@@ -259,7 +323,10 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
                 "Enter/Space edit or toggle · r reset value · click edit · wheel scroll".into(),
             ]
         };
-        lines.push("Ctrl+S save · Esc close · Ctrl+D discard & close · Ctrl+Q quit".into());
+        lines.push(
+            "Ctrl+S save preview · h global history · Esc close · Ctrl+D discard & close · Ctrl+Q quit"
+                .into(),
+        );
         lines.push(global.into());
         lines
     } else if app.filter_editing {
@@ -275,13 +342,13 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
             global.into(),
             "Move: ↑↓/kj · PgUp/PgDn · Home/End · Tab/Shift+Tab/←→ panes".into(),
             if app.view == View::Configurations {
-                "Enter edit config · r refresh · n remote results · ? help · q/Esc/Ctrl+Q quit"
+                "Enter edit config · h global history · r refresh · n remote results · ? help · q/Esc/Ctrl+Q quit"
                     .into()
             } else {
                 "Enter pick · / filter · b branch · s save · r refresh".into()
             },
             if app.view == View::Repositories {
-                "n remote results · ? help · q/Esc/Ctrl+Q quit".into()
+                "h global history · n remote results · ? help · q/Esc/Ctrl+Q quit".into()
             } else {
                 "Mouse: click select/edit · wheel scroll".into()
             },
@@ -292,6 +359,10 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
             },
         ]
     };
+    wrap_footer(&groups, width)
+}
+
+fn wrap_footer(groups: &[String], width: usize) -> Vec<String> {
     let mut lines = Vec::new();
     for group in groups.iter().filter(|s| !s.is_empty()) {
         let mut line = String::new();
@@ -336,11 +407,14 @@ fn draw_configs(f: &mut Frame, app: &mut App, area: Rect) {
             .entries
             .get(module.entry_idx)
             .and_then(|e| e.updates.as_ref())
-            .is_some_and(|u| u.newer > 0);
-        let name_width = (inner.width as usize).saturating_sub(if badge { 6 } else { 0 });
+            .map(|u| u.row_badge())
+            .unwrap_or_default();
+        let name_width = (inner.width as usize).saturating_sub(
+            UnicodeWidthStr::width(badge.as_str()) + usize::from(!badge.is_empty()),
+        );
         let mut spans = vec![Span::raw(ellipsize(&module.name, name_width))];
-        if badge {
-            spans.push(Span::styled(" [new]", Style::new().fg(CURRENT)));
+        if !badge.is_empty() {
+            spans.push(Span::styled(format!(" {badge}"), Style::new().fg(CURRENT)));
         }
         let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
         let style = if idx == app.config_repos.selected() {
@@ -507,6 +581,7 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
     for (label, hit) in [
         ("[ Save · Ctrl+S ]", Hit::ParameterSave),
         ("[ Back · Esc ]", Hit::ParameterBack),
+        ("[ History · h ]", Hit::ParameterHistory),
     ] {
         let width = (UnicodeWidthStr::width(label) as u16).min(rows[3].right().saturating_sub(x));
         if width > 0 && rows[3].height > 0 {
@@ -574,6 +649,516 @@ fn draw_form(f: &mut Frame, app: &mut App, area: Rect) {
                 .wrap(Wrap { trim: false }),
             rows[3],
         );
+    }
+    if form.overlay.is_some() {
+        draw_config_overlay(f, app, area);
+    }
+}
+
+fn change_lines(changes: &[crate::history::Change], offset: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for change in changes.iter().skip(offset) {
+        lines.push(Line::from(safe_text(&change.name)).fg(ACCENT));
+        lines.push(Line::from(format!("  − {}", safe_text(&change.before))).fg(WARNING));
+        lines.push(Line::from(format!("  + {}", safe_text(&change.after))).fg(PICKED));
+    }
+    if changes.is_empty() {
+        lines.push(Line::from("No parameter differences."));
+    }
+    lines
+}
+
+fn safe_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_control() {
+                c.escape_default().to_string()
+            } else {
+                c.to_string()
+            }
+        })
+        .collect()
+}
+
+fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
+    app.hit_zones.clear();
+    let popup = centered_rect(98, 98, area);
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(" Global session history · opened checkout · never pushed ")
+        .border_style(pane_border(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let browser = app.global_history.as_mut().unwrap();
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(browser.visible.len().clamp(1, 5) as u16),
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    f.render_widget(
+        Paragraph::new(format!(
+            "{} / {} rows · find: {} · file: {} · {} focus · {}",
+            browser.visible.len(),
+            browser.rows.len(),
+            safe_text(&browser.filter),
+            safe_text(browser.file_filter.as_deref().unwrap_or("all")),
+            if browser.diff_focus {
+                "diff"
+            } else {
+                "entries"
+            },
+            browser.location()
+        ))
+        .fg(ACCENT),
+        rows[0],
+    );
+    browser.scroll.ensure_visible(rows[1].height as usize);
+    let (offset, count) = browser.scroll.visible(rows[1].height as usize);
+    for row in 0..count {
+        let idx = offset + row;
+        let text = safe_text(&browser.row_text(browser.visible[idx]));
+        let rect = Rect::new(rows[1].x, rows[1].y + row as u16, rows[1].width, 1);
+        f.render_widget(
+            Paragraph::new(ellipsize(&text, rect.width as usize)).style(
+                if idx == browser.scroll.selected() {
+                    selected_style(!browser.diff_focus)
+                } else {
+                    Style::default()
+                },
+            ),
+            rect,
+        );
+        app.hit_zones.push((rect, Hit::HistoryRow(idx)));
+    }
+    if browser.visible.is_empty() {
+        f.render_widget(
+            Paragraph::new(
+                "No matching history. All modules use the checkout's central journal; u opens unfinished restores.",
+            ),
+            rows[1],
+        );
+    }
+    let title = if browser.compare_current {
+        "Current → selected"
+    } else {
+        if matches!(
+            browser.selected_row(),
+            Some(crate::history::HistoryRow::Save(_))
+        ) {
+            "Selected save: previous → saved"
+        } else {
+            "Session/action/file: first before → last after"
+        }
+    };
+    let target = if browser.before { "before" } else { "after" };
+    let context = if matches!(
+        browser.selected_row(),
+        Some(crate::history::HistoryRow::Save(_) | crate::history::HistoryRow::File(_))
+    ) {
+        browser
+            .selected()
+            .map(|e| format!("{} · {} · {} · {}", e.module, e.path, e.branch, e.commit))
+            .unwrap_or_default()
+    } else {
+        browser.selected_label()
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "{title} · {target} snapshot · {} warning(s)",
+                browser.warnings.len()
+            ))
+            .fg(ACCENT),
+            Line::from(safe_text(&context)).dim(),
+        ]),
+        rows[2],
+    );
+    if browser.show_warnings {
+        let mut warnings = browser.warnings.clone();
+        if let Some(crate::history::HistoryRow::Recovery(i)) = browser.selected_row() {
+            warnings.extend(browser.recoveries[*i].details.clone());
+        }
+        browser.diff_scroll = browser.diff_scroll.min(warnings.len().saturating_sub(1));
+        let lines: Vec<_> = warnings
+            .iter()
+            .skip(browser.diff_scroll)
+            .map(|w| Line::from(safe_text(w)).fg(WARNING))
+            .collect();
+        f.render_widget(
+            Paragraph::new(if lines.is_empty() {
+                vec![Line::from("No warnings.")]
+            } else {
+                lines
+            })
+            .wrap(Wrap { trim: false }),
+            rows[3],
+        );
+    } else {
+        match browser.comparison() {
+            Ok(changes) => {
+                browser.diff_scroll = browser.diff_scroll.min(changes.len().saturating_sub(1));
+                f.render_widget(
+                    Paragraph::new(change_lines(&changes, browser.diff_scroll))
+                        .wrap(Wrap { trim: false }),
+                    rows[3],
+                );
+            }
+            Err(e) => f.render_widget(
+                Paragraph::new(format!("Cannot compare: {e:#}"))
+                    .fg(WARNING)
+                    .wrap(Wrap { trim: false }),
+                rows[3],
+            ),
+        }
+    }
+    f.render_widget(
+        Paragraph::new(safe_text(&browser.notice)).fg(CURRENT),
+        rows[4],
+    );
+    let buttons = [
+        ("[ Compare c ]", Hit::HistoryCompare),
+        ("[ Before/after b ]", Hit::HistoryVersion),
+        ("[ Review r ]", Hit::HistoryRestore),
+        ("[ Close ]", Hit::ConfigCancel),
+    ];
+    let columns =
+        Layout::horizontal(std::iter::repeat_n(Constraint::Ratio(1, 4), 4)).split(rows[5]);
+    for (i, (label, hit)) in buttons.into_iter().enumerate() {
+        draw_button(f, app, columns[i], label, hit, ButtonPos::Center);
+    }
+}
+
+fn draw_batch_review(f: &mut Frame, app: &mut App, area: Rect) {
+    app.hit_zones.clear();
+    let popup = centered_rect(98, 98, area);
+    f.render_widget(Clear, popup);
+    let review = app.batch_review.as_mut().unwrap();
+    let block = Block::bordered()
+        .title(if review.outcome.is_some() {
+            " Session restore result · recovery snapshots retained "
+        } else {
+            " Review session restore · no changes until confirmed "
+        })
+        .border_style(pane_border(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let rows = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(2),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "{} file(s) · {} repository state(s) · {} blocking issue(s) · {} warning(s)",
+                review.files.len(),
+                review
+                    .repositories
+                    .iter()
+                    .filter(|p| !p.before.checkout_eq(&p.after))
+                    .count(),
+                review.errors.len(),
+                review.warnings.len()
+            ))
+            .fg(ACCENT),
+            Line::from(safe_text(&review.label)).dim(),
+        ]),
+        rows[0],
+    );
+    let mut lines = Vec::new();
+    if let Some(outcome) = &review.outcome {
+        lines.push(
+            Line::from(safe_text(outcome)).fg(if outcome.starts_with("Restore stopped:") {
+                WARNING
+            } else {
+                CURRENT
+            }),
+        );
+    }
+    for error in &review.errors {
+        lines.push(Line::from(format!("BLOCKED: {}", safe_text(error))).fg(WARNING));
+    }
+    for warning in &review.warnings {
+        lines.push(Line::from(format!("WARNING: {}", safe_text(warning))).fg(WARNING));
+    }
+    if review.files.is_empty()
+        && review
+            .repositories
+            .iter()
+            .all(|p| p.before.checkout_eq(&p.after))
+        && review.errors.is_empty()
+    {
+        lines.push(Line::from(
+            "All selected values are already on disk. No config save entries will be added.",
+        ));
+    }
+    for repository in &review.repositories {
+        lines.extend(change_lines(
+            &crate::repository_history::changes(&repository.before, &repository.after, false),
+            0,
+        ));
+    }
+    for file in &review.files {
+        lines.push(
+            Line::from(safe_text(&file.path))
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD),
+        );
+        lines.extend(change_lines(&file.changes, 0));
+    }
+    review.scroll = review.scroll.min(lines.len().saturating_sub(1));
+    f.render_widget(
+        Paragraph::new(lines.into_iter().skip(review.scroll).collect::<Vec<_>>())
+            .wrap(Wrap { trim: false }),
+        rows[1],
+    );
+    f.render_widget(Paragraph::new(vec![
+        Line::from(format!("Note{}: {}{}", if review.note_editing { " (editing)" } else { " · n edits" }, safe_text(&review.note), if review.note_editing { "▌" } else { "" })),
+        Line::from("Multi-target writes are not atomic. A partial failure stops further writes and retains a reviewed resume/rollback plan.").fg(WARNING),
+    ]).wrap(Wrap { trim: false }),rows[2]);
+    let completed = review.outcome.is_some();
+    let blocked = !review.errors.is_empty();
+    let columns =
+        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(rows[3]);
+    if completed {
+        draw_button(
+            f,
+            app,
+            columns[0],
+            "[ Close result · Enter ]",
+            Hit::ConfigCancel,
+            ButtonPos::Center,
+        );
+    } else if !blocked {
+        draw_button(
+            f,
+            app,
+            columns[0],
+            "[ Confirm ALL · Enter ]",
+            Hit::ConfigConfirm,
+            ButtonPos::Center,
+        );
+    }
+    draw_button(
+        f,
+        app,
+        columns[1],
+        if completed {
+            "[ Close · Esc ]"
+        } else {
+            "[ Cancel · Esc ]"
+        },
+        Hit::ConfigCancel,
+        ButtonPos::Center,
+    );
+}
+
+fn draw_config_overlay(f: &mut Frame, app: &mut App, area: Rect) {
+    app.hit_zones.clear(); // Only the topmost modal's controls may receive clicks.
+    let popup = centered_rect(96, 96, area);
+    f.render_widget(Clear, popup);
+    let form = app.form.as_mut().unwrap();
+    let title = if matches!(form.overlay, Some(crate::config::Overlay::Save { .. })) {
+        " Review config save "
+    } else {
+        " Local config history · never pushed "
+    };
+    let block = Block::bordered()
+        .title(title)
+        .border_style(pane_border(true));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    // Take the overlay so comparison helpers can read the form without conflicting borrows.
+    let comparison = form.history_comparison();
+    let mut overlay = form.overlay.take().unwrap();
+    let mut buttons = Vec::new();
+    let button_row;
+    match &mut overlay {
+        crate::config::Overlay::Save {
+            changes,
+            note,
+            note_editing,
+            scroll,
+        } => {
+            let rows = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(2),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "{} parameter change(s) · {}",
+                    changes.len(),
+                    form.path.display()
+                ))
+                .fg(ACCENT),
+                rows[0],
+            );
+            *scroll = (*scroll).min(changes.len().saturating_sub(1));
+            f.render_widget(
+                Paragraph::new(change_lines(changes, *scroll)).wrap(Wrap { trim: false }),
+                rows[1],
+            );
+            let text = format!("Note (n): {note}{}", if *note_editing { "▌" } else { "" });
+            f.render_widget(
+                Paragraph::new(text)
+                    .fg(if *note_editing { ACCENT } else { MUTED })
+                    .wrap(Wrap { trim: false }),
+                rows[2],
+            );
+            f.render_widget(
+                Paragraph::new(form.notice.clone())
+                    .fg(CURRENT)
+                    .wrap(Wrap { trim: false }),
+                rows[3],
+            );
+            button_row = rows[4];
+            buttons.extend([
+                ("[ Confirm save ]", Hit::ConfigConfirm),
+                ("[ Back to edits ]", Hit::ConfigCancel),
+            ]);
+        }
+        crate::config::Overlay::History {
+            entries,
+            scroll,
+            record,
+            compare_current,
+            before,
+            diff_scroll,
+            diff_focus,
+        } => {
+            let rows = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Length(5),
+                Constraint::Length(2),
+                Constraint::Min(0),
+                Constraint::Length(2),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+            f.render_widget(
+                Paragraph::new(format!(
+                    "{} entries · {} · {} focus",
+                    entries.len(),
+                    form.path.display(),
+                    if *diff_focus { "diff" } else { "history" }
+                ))
+                .fg(ACCENT),
+                rows[0],
+            );
+            scroll.ensure_visible(rows[1].height as usize);
+            let (offset, count) = scroll.visible(rows[1].height as usize);
+            for row in 0..count {
+                let idx = offset + row;
+                let entry = &entries[idx];
+                let time = chrono::DateTime::from_timestamp(entry.timestamp, 0)
+                    .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| "unknown time".into());
+                let text = format!(
+                    "{time} · {} · {} changes · {} · {}",
+                    entry.branch, entry.changes, entry.state, entry.note
+                );
+                let rect = Rect::new(rows[1].x, rows[1].y + row as u16, rows[1].width, 1);
+                f.render_widget(
+                    Paragraph::new(ellipsize(&text, rect.width as usize)).style(
+                        if idx == scroll.selected() {
+                            selected_style(!*diff_focus)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+                    rect,
+                );
+                app.hit_zones.push((rect, Hit::HistoryRow(idx)));
+            }
+            if entries.is_empty() {
+                f.render_widget(
+                    Paragraph::new(
+                        "No saved changes yet. The first save records the baseline too.",
+                    ),
+                    rows[1],
+                );
+            }
+            let heading = format!(
+                "{} · target: {} snapshot",
+                if *compare_current {
+                    "Restore preview: current → selected"
+                } else {
+                    "Selected save: previous → saved"
+                },
+                if *before { "before" } else { "after" }
+            );
+            let context = record
+                .as_ref()
+                .map(|r| {
+                    format!(
+                        "{} · {} · {}{}",
+                        r.branch,
+                        r.commit,
+                        r.note,
+                        r.restored_from
+                            .as_ref()
+                            .map(|s| format!(" · restored from {s}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .unwrap_or_default();
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::from(heading).fg(ACCENT),
+                    Line::from(context).dim(),
+                ])
+                .wrap(Wrap { trim: false }),
+                rows[2],
+            );
+            match comparison {
+                Ok(changes) => {
+                    *diff_scroll = (*diff_scroll).min(changes.len().saturating_sub(1));
+                    f.render_widget(
+                        Paragraph::new(change_lines(&changes, *diff_scroll))
+                            .wrap(Wrap { trim: false }),
+                        rows[3],
+                    );
+                }
+                Err(e) => f.render_widget(
+                    Paragraph::new(format!("Cannot compare: {e:#}"))
+                        .fg(WARNING)
+                        .wrap(Wrap { trim: false }),
+                    rows[3],
+                ),
+            }
+            f.render_widget(
+                Paragraph::new(form.notice.clone())
+                    .fg(CURRENT)
+                    .wrap(Wrap { trim: false }),
+                rows[4],
+            );
+            button_row = rows[5];
+            buttons.extend([
+                ("[ Compare · c ]", Hit::HistoryCompare),
+                ("[ Before/after · b ]", Hit::HistoryVersion),
+                ("[ Load restore · r ]", Hit::HistoryRestore),
+                ("[ Close ]", Hit::ConfigCancel),
+            ]);
+        }
+    }
+    form.overlay = Some(overlay);
+    let columns = Layout::horizontal(std::iter::repeat_n(
+        Constraint::Ratio(1, buttons.len() as u32),
+        buttons.len(),
+    ))
+    .split(button_row);
+    for (i, (label, hit)) in buttons.into_iter().enumerate() {
+        draw_button(f, app, columns[i], label, hit, ButtonPos::Center);
     }
 }
 
@@ -704,13 +1289,8 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
                 spans.push(dirty_span(m.dirty));
-                if app
-                    .entries
-                    .get(idx)
-                    .and_then(|e| e.updates.as_ref())
-                    .is_some_and(|u| u.newer > 0)
-                {
-                    spans.push(Span::styled(" [new]", Style::new().fg(CURRENT)));
+                if let Some(badge) = branch_badge(app, idx) {
+                    spans.push(badge);
                 }
                 let name_width =
                     (inner.width as usize).saturating_sub(Line::from(spans.clone()).width());
@@ -747,13 +1327,8 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
                 if sm.dirty == Some(true) {
                     spans.push(dirty_span(true));
                 }
-                if app
-                    .entries
-                    .get(idx)
-                    .and_then(|e| e.updates.as_ref())
-                    .is_some_and(|u| u.newer > 0)
-                {
-                    spans.push(Span::styled(" [new]", Style::new().fg(CURRENT)));
+                if let Some(badge) = branch_badge(app, idx) {
+                    spans.push(badge);
                 }
                 let name_width =
                     (inner.width as usize).saturating_sub(Line::from(spans.clone()).width());
@@ -991,18 +1566,56 @@ fn summary_lines(app: &App) -> Vec<Line<'static>> {
         ],
         None => Vec::new(),
     };
-    if let Some(update) = app
-        .entries
-        .get(idx)
-        .and_then(|e| e.updates.as_ref())
-        .filter(|u| u.newer > 0)
-    {
-        first.push(Span::styled(
-            format!(" [new] {} commit(s) on {}", update.newer, update.branch),
-            Style::new().fg(CURRENT),
-        ));
+    if let Some(badge) = branch_badge(app, idx) {
+        first.push(badge);
     }
-    vec![Line::from(first), pick_line(app, idx)]
+    let second = if app.entries.get(idx).is_some_and(|e| e.pick.is_some()) {
+        pick_line(app, idx)
+    } else if let Some(info) = app.entries.get(idx).and_then(|e| e.updates.as_ref()) {
+        let text = if info.unknown || info.unborn {
+            info.detail()
+        } else if !info.has_upstream {
+            format!(
+                "No upstream · {} missing · {}{}",
+                info.newer,
+                info.branch,
+                if info.detached { " · detached" } else { "" }
+            )
+        } else {
+            format!(
+                "+{} ahead / -{} behind · {} missing · {}{}",
+                info.ahead,
+                info.behind,
+                info.newer,
+                info.branch,
+                if info.detached { " · detached" } else { "" }
+            )
+        };
+        Line::from(text).fg(if info.ahead > 0 && info.behind > 0 {
+            WARNING
+        } else {
+            CURRENT
+        })
+    } else {
+        Line::from("")
+    };
+    vec![Line::from(first), second]
+}
+
+fn branch_badge(app: &App, idx: usize) -> Option<Span<'static>> {
+    let info = app.entries.get(idx)?.updates.as_ref()?;
+    let badge = info.row_badge();
+    if badge.is_empty() {
+        return None;
+    }
+    Some(Span::styled(
+        format!(" {badge}"),
+        Style::new().fg(if info.ahead > 0 && info.behind > 0 {
+            WARNING
+        } else {
+            CURRENT
+        }),
+    ))
 }
 
 /// The second summary line: the pending pick, or blank.
@@ -1478,7 +2091,27 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("q / Esc", "quit (or close a popup)"),
         ("Ctrl+Q", "quit (protects unsaved edits)"),
         ("YAML forms", "Enter value/toggle; / find; r reset"),
-        ("Form save/close", "Ctrl+S save; Esc close; Ctrl+D discard"),
+        (
+            "Form save/close",
+            "Ctrl+S review/confirm; Esc close; Ctrl+D discard",
+        ),
+        (
+            "Global session history",
+            "h opens; Enter expands session into actions/files; Backspace up",
+        ),
+        (
+            "History browsing",
+            "/ find; f file/all; n session note; R reload; w warnings; u recovery",
+        ),
+        (
+            "History restoring",
+            "c current comparison; b before/after; r review selected scope",
+        ),
+        (
+            "Session restore review",
+            "Enter confirm all; n note; Esc cancel; ↑↓/Pg/Home/End scroll",
+        ),
+        ("Ctrl+X", "cancel fetch/remaining repos; finish checkout"),
     ];
     let mut lines = vec![
         Line::from("Keys").add_modifier(Modifier::BOLD),
@@ -1495,7 +2128,13 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from("  ○ where the submodule's working directory is"));
     lines.push(Line::from("  ✓ your pick"));
     lines.push(Line::from(
-        "  [new] commits missing locally on selected branch",
+        "  [new: N] commits missing from checkout; [ahead: N] local-only",
+    ));
+    lines.push(Line::from(
+        "  [diverged] both sides differ; [detached] / [branch unknown]",
+    ));
+    lines.push(Line::from(
+        "  [no upstream] / [unborn] cannot pull normally",
     ));
     lines.push(Line::from(
         "  Badges use stored refs; confirmed pulls refresh remotes.".dim(),
@@ -1647,6 +2286,40 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn repository_only_history_shows_branch_diff_and_safe_restore_review_at_all_sizes() {
+        let (mut app, _temp) = make_branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('h')));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Global session history"));
+        assert!(text.contains("branch / checkout commit"));
+        assert!(text.contains("− main @") && text.contains("+ feature @"));
+        assert!(app.global_history.as_ref().unwrap().entries.is_empty());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('r')));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Review session restore"));
+        assert!(text.contains("no changes until confirmed"));
+        assert!(text.contains("1 repository state(s)"));
+        assert!(text.contains("− feature @") && text.contains("+ main @"));
+        for (w, h) in [(1, 1), (8, 3), (20, 10), (80, 24)] {
+            render(&mut app, w, h);
+        }
+        assert_eq!(
+            app.repo.as_ref().unwrap().head().unwrap().shorthand(),
+            Some("feature")
+        );
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.batch_review.is_none());
+        assert_eq!(
+            app.repo.as_ref().unwrap().head().unwrap().shorthand(),
+            Some("feature")
+        );
     }
 
     fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
@@ -1907,10 +2580,155 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ParameterSave).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(save.x + 1, save.y));
+        let text = screen_text(&render(&mut app, 80, 24));
+        assert!(text.contains("Review config save"), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# controller\ngain: 1\n"
+        );
+        let confirm = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::ConfigConfirm).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(confirm.x, confirm.y));
         assert_eq!(
             std::fs::read_to_string(app.form.as_ref().unwrap().path.clone()).unwrap(),
             "# controller\ngain: 3\n"
         );
+    }
+
+    #[test]
+    fn config_history_popup_compares_restores_and_tolerates_tiny_screens() {
+        let (mut app, temp) = make_normal_app();
+        let path = temp.path().join("super/subA/config/params.yaml");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "gain: 1\n").unwrap();
+        app.view = View::Configurations;
+        app.form = Some(crate::config::Form::open(path.clone()).unwrap());
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_paste("2");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let text = screen_text(&render(&mut app, 100, 36));
+        assert!(text.contains("Review config save"));
+        assert!(text.contains("− 1") && text.contains("+ 2"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gain: 1\n");
+        for (w, h) in [(1, 1), (8, 3), (20, 10)] {
+            render(&mut app, w, h);
+        }
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Enter)); // session → files
+        app.handle_key(key(KeyCode::Enter)); // file → individual saves
+        let text = screen_text(&render(&mut app, 100, 36));
+        assert!(text.contains("Global session history") && text.contains("never pushed"));
+        assert!(text.contains("previous → saved"));
+        assert!(text.contains("− 1") && text.contains("+ 2"));
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Char('b')));
+        let text = screen_text(&render(&mut app, 100, 36));
+        assert!(text.contains("Current → selected") && text.contains("before snapshot"));
+        assert!(text.contains("− 2") && text.contains("+ 1"));
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::End));
+        render(&mut app, 100, 36);
+        for (w, h) in [(1, 1), (8, 3), (20, 10)] {
+            render(&mut app, w, h);
+        }
+        render(&mut app, 100, 36);
+        let restore = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::HistoryRestore).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(restore.x, restore.y));
+        assert!(app.form.as_ref().unwrap().dirty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gain: 2\n");
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "gain: 1\n");
+        assert_eq!(
+            crate::history::Store::open_in(&path, &app.overview.as_ref().unwrap().root)
+                .unwrap()
+                .list()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn session_restore_review_is_modal_lists_all_files_and_requires_mouse_confirmation() {
+        let (mut app, temp) = make_normal_app();
+        let root = temp.path().join("super").canonicalize().unwrap();
+        let paths = [
+            root.join("config/main.yaml"),
+            root.join("subA/config/gains.yaml"),
+        ];
+        for (path, value) in paths.iter().zip(["2", "4"]) {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "gain: 1\n").unwrap();
+            app.form = Some(crate::config::Form::open_in(path.clone(), &root).unwrap());
+            app.handle_key(key(KeyCode::Enter));
+            app.handle_paste(value);
+            app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+            app.handle_key(key(KeyCode::Enter));
+        }
+        app.handle_key(key(KeyCode::Char('h')));
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_paste("Dry test");
+        app.handle_key(key(KeyCode::Enter));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Dry test"));
+        assert!(text.contains("2 modules / 2 files / 2 saves"));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('r')));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Review session restore"));
+        assert!(text.contains("config/main.yaml") && text.contains("subA/config/gains.yaml"));
+        assert!(text.contains("− 2") && text.contains("− 4") && text.contains("+ 1"));
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "gain: 2\n");
+        // Shortcuts cannot escape this confirmation or start pulling behind it.
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.network_job.is_none());
+        assert!(app.batch_review.is_some());
+        for (w, h) in [(1, 1), (8, 3), (20, 10), (80, 24)] {
+            render(&mut app, w, h);
+        }
+        render(&mut app, 100, 32);
+        let cancel = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::ConfigCancel).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(cancel.x, cancel.y));
+        assert!(app.batch_review.is_none());
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "gain: 2\n");
+        app.handle_key(key(KeyCode::Char('r')));
+        render(&mut app, 100, 32);
+        let confirm = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::ConfigConfirm).then_some(*rect))
+            .unwrap();
+        app.handle_mouse(click(confirm.x, confirm.y));
+        assert!(
+            app.batch_review
+                .as_ref()
+                .unwrap()
+                .outcome
+                .as_ref()
+                .unwrap()
+                .contains("Restored 2")
+        );
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Session restore result"));
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "gain: 1\n");
+        assert_eq!(std::fs::read_to_string(&paths[1]).unwrap(), "gain: 1\n");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.batch_review.is_none());
+        assert_eq!(app.global_history.as_ref().unwrap().entries.len(), 4);
     }
 
     #[test]
@@ -1943,8 +2761,8 @@ mod tests {
         let row: String = (rect.x..rect.x + rect.width)
             .map(|x| buffer[(x, rect.y)].symbol())
             .collect();
-        assert!(row.contains("[new]"), "{row}");
-        let position = row.find("[new]").unwrap();
+        assert!(row.contains("[new: 1]"), "{row}");
+        let position = row.find("[new: 1]").unwrap();
         let x = rect.x + UnicodeWidthStr::width(&row[..position]) as u16;
         assert_eq!(buffer[(x, rect.y)].fg, CURRENT);
     }

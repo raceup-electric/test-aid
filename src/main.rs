@@ -58,7 +58,7 @@ fn run_tui() -> ExitCode {
         }
     };
 
-    let result = event::run(&mut app, &mut terminal);
+    let result = event::run(&mut app, &mut terminal).and_then(|_| app.finish_session());
     term::restore(&mut terminal);
 
     match result {
@@ -81,7 +81,14 @@ USAGE:
     taid --help        Print this help
 
 Ctrl+R,R repositories · Ctrl+C,C configurations · Ctrl+P,P pull all
-YAML forms: Enter edits a parameter; Ctrl+S saves. Quit: q / Esc / Ctrl+Q.
+YAML forms: Enter edits; Ctrl+S reviews/confirms.
+h global session history (never pushed): repository actions + config saves,
+Enter expands sessions/files,
+Backspace up, / search, f file/all, n session description, c compare,
+b before/after, r review restore, R reload, w warnings, u unfinished restores.
+Session/action/file restore: Enter confirms reviewed targets; Esc cancels.
+Ctrl+X cancels remote work.
+Quit: q / Esc / Ctrl+Q.
 No remote operations run at startup. Ctrl+P,P asks for confirmation;
 confirmed pulls are fast-forward only. System Git is required
 for remote operations. taid never pushes, creates commits, or rewrites history.
