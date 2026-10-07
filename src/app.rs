@@ -161,12 +161,13 @@ pub fn entry_at(ov: &RepoOverview, idx: usize) -> Option<Entry<'_>> {
     }
 }
 
-/// Viewport heights of the two panes, recorded by the renderer so key
+/// Viewport heights of the panes and save review, recorded by the renderer so key
 /// handling can page-scroll and keep the selection visible.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PaneHeights {
     pub repos: usize,
     pub commits: usize,
+    pub save: usize,
 }
 
 /// A selection plus a scroll offset into a list of `len` items.
@@ -200,6 +201,11 @@ impl ScrollState {
 
     pub fn offset(&self) -> usize {
         self.offset
+    }
+
+    /// The renderer accounts for variable-height wrapped commit rows.
+    pub fn set_offset(&mut self, offset: usize) {
+        self.offset = offset.min(self.len.saturating_sub(1));
     }
 
     /// Resize the list, keeping selection and offset in range.
@@ -289,6 +295,11 @@ pub struct EntryState {
     pub filtered_for: String,
     pub branch: Option<String>,
     pub updates: Option<gitx::UpdateInfo>,
+    /// Physical line offset within an oversized selected commit description.
+    pub commit_text_scroll: usize,
+    /// Wrapped height and visible commit count recorded by the renderer.
+    pub commit_text_height: usize,
+    pub commit_page: usize,
 }
 
 impl EntryState {
@@ -303,6 +314,9 @@ impl EntryState {
             filtered_for: String::new(),
             branch: None,
             updates: None,
+            commit_text_scroll: 0,
+            commit_text_height: 0,
+            commit_page: 1,
         }
     }
 }
@@ -348,6 +362,7 @@ pub struct App {
     pub popup: Option<Popup>,
     pub branch_popup: Option<BranchPopup>,
     pub save_popup: Option<SaveStage>,
+    pub save_scroll: usize,
     /// Control regions, refreshed by the renderer for layout verification.
     pub hit_zones: Vec<(Rect, Hit)>,
     pub pane_heights: PaneHeights,
@@ -403,6 +418,7 @@ impl App {
             popup: None,
             branch_popup: None,
             save_popup: None,
+            save_scroll: 0,
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
@@ -450,6 +466,7 @@ impl App {
             popup: None,
             branch_popup: None,
             save_popup: None,
+            save_scroll: 0,
             hit_zones: Vec::new(),
             pane_heights: PaneHeights::default(),
             should_quit: false,
@@ -1484,6 +1501,9 @@ impl App {
             })
             .collect();
         entry.scroll = ScrollState::new(entry.visible.len());
+        entry.commit_text_scroll = 0;
+        entry.commit_text_height = 0;
+        entry.commit_page = 1;
         entry.filtered_for = filter.clone();
     }
 
@@ -1660,6 +1680,24 @@ impl App {
     fn handle_save_key(&mut self, code: KeyCode) {
         let confirming = matches!(self.save_popup, Some(SaveStage::Confirm(_)));
         match code {
+            KeyCode::Up | KeyCode::Char('k') if confirming => {
+                self.save_scroll = self.save_scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') if confirming => {
+                self.save_scroll = self.save_scroll.saturating_add(1)
+            }
+            KeyCode::PageUp if confirming => {
+                self.save_scroll = self
+                    .save_scroll
+                    .saturating_sub(self.pane_heights.save.max(1))
+            }
+            KeyCode::PageDown if confirming => {
+                self.save_scroll = self
+                    .save_scroll
+                    .saturating_add(self.pane_heights.save.max(1))
+            }
+            KeyCode::Home if confirming => self.save_scroll = 0,
+            KeyCode::End if confirming => self.save_scroll = usize::MAX,
             KeyCode::Char('n') if confirming => self.action_note_editing = true,
             KeyCode::Enter if confirming => self.apply_saves(),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.save_popup = None,
@@ -1683,6 +1721,7 @@ impl App {
         let changes = self.pending_saves();
         self.action_note.clear();
         self.action_note_editing = !changes.is_empty();
+        self.save_scroll = 0;
         self.save_popup = Some(SaveStage::Confirm(changes));
     }
 
@@ -1871,7 +1910,23 @@ impl App {
                 self.ensure_repos_visible();
             }
             Focus::Commits => {
-                let h = self.pane_heights.commits.max(1);
+                let viewport = self.pane_heights.commits.max(1);
+                let entry = &mut self.entries[self.repos.selected()];
+                let max = entry.commit_text_height.saturating_sub(viewport);
+                if delta > 0 && entry.commit_text_scroll < max {
+                    entry.commit_text_scroll = entry
+                        .commit_text_scroll
+                        .saturating_add(viewport.saturating_sub(1).max(1))
+                        .min(max);
+                    return;
+                }
+                if delta < 0 && entry.commit_text_scroll > 0 {
+                    entry.commit_text_scroll = entry
+                        .commit_text_scroll
+                        .saturating_sub(viewport.saturating_sub(1).max(1));
+                    return;
+                }
+                let h = entry.commit_page.max(1);
                 self.commit_scroll(|s| s.page_by(h, delta));
             }
         }
@@ -1905,7 +1960,12 @@ impl App {
         // selected entry has an empty (len 0) scroll until its history loads.
         self.ensure_entry_loaded(idx);
         if let Some(entry) = self.entries.get_mut(idx) {
+            let selected = entry.scroll.selected();
             f(&mut entry.scroll);
+            if selected != entry.scroll.selected() {
+                entry.commit_text_scroll = 0;
+                entry.commit_text_height = 0;
+            }
             entry
                 .scroll
                 .ensure_visible(self.pane_heights.commits.max(1));

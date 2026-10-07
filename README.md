@@ -100,7 +100,9 @@ The header shows the discovered repository root. With submodules, the left pane
 lists the main repository first, followed by its submodules; the right pane
 shows the selected repository's commits. Without submodules, the commit browser
 uses the full width. Each commit shows a short hash, its timestamp in the
-commit's own timezone, and its title.
+commit's own timezone, title, and author name. Descriptions wrap across multiple
+lines instead of being truncated. If a selected commit is taller than the pane,
+`PgUp`/`PgDn` scroll its description before moving to another page of commits.
 
 The default view is **Repositories**. Press `Ctrl+R`, then `R` to return to it;
 press `Ctrl+C`, then `C` to open **Configurations**. Both shortcuts also work
@@ -115,7 +117,9 @@ those use the yellow `[new: N]` badge.
 
 Select a commit with `Enter` to mark it as a pending pick. Press `s` to review
 the changes, write the required note, then `Enter` to finish it and `Enter` again
-to apply. Closing the popup or
+to apply. The save preview also wraps complete titles and author names; after
+finishing the note, use `↑`/`↓`, `PgUp`/`PgDn`, or `Home`/`End` to scroll it.
+Closing the popup or
 quitting without applying leaves the picks unapplied. Save handles each pick in
 turn and reports successes and failures; failed picks remain available to retry.
 
@@ -230,8 +234,9 @@ Session → repository action / file → individual save navigation keeps interm
   session/file row. For `gain: 1 → 2 → 3`, the session diff is `1 → 3` while both
   saves remain accessible. Individual saves show **previous → saved**.
   Repository diffs show branch/checkout commit and staged submodule gitlinks
-  separately, with seven-character commit hashes and titles. Unavailable commit
-  objects show the short hash and a title-unavailable label; audit and restore
+  separately, with seven-character commit hashes, titles and author names
+  (`a1b2c3d · Commit title · by Author Name`). Unavailable commit
+  objects show the short hash and title/author-unavailable labels; audit and restore
   records retain full hashes. Local branch tips and fetched remote refs are audit context only;
   restoring never rewinds them. Action rows retain requests and results, even
   if the checkout did not change.

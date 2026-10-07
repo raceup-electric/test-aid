@@ -634,7 +634,7 @@ pub fn display_head(root: &Path, module: &str, head: &Head) -> String {
     )
 }
 
-/// Replace full commit IDs in action requests/results with a short ID and title.
+/// Replace full commit IDs with a short ID, title and author name.
 /// Missing/pruned objects still show their short ID without breaking history.
 pub fn display_commit_text(root: &Path, module: &str, text: &str) -> String {
     let repo = open(root, module).ok();
@@ -650,19 +650,24 @@ pub fn display_commit_text(root: &Path, module: &str, text: &str) -> String {
             token.push(chars.next().unwrap());
         }
         if token.len() == 40 {
-            let title = token
+            let description = token
                 .parse::<Oid>()
                 .ok()
                 .and_then(|oid| repo.as_ref()?.find_commit(oid).ok())
                 .map(|commit| {
-                    commit
+                    let title = commit
                         .summary()
                         .filter(|title| !title.is_empty())
-                        .unwrap_or("(no title)")
-                        .to_owned()
+                        .unwrap_or("(no title)");
+                    let author = commit.author();
+                    let name = author
+                        .name()
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or("(author unavailable)");
+                    format!("{title} · by {name}")
                 })
-                .unwrap_or_else(|| "(title unavailable)".into());
-            output.push_str(&format!("{} · {title}", &token[..7]));
+                .unwrap_or_else(|| "(title unavailable) · by (author unavailable)".into());
+            output.push_str(&format!("{} · {description}", &token[..7]));
         } else {
             output.push_str(&token);
         }
@@ -1217,16 +1222,22 @@ mod tests {
             .unwrap();
         assert_eq!(
             pointer.before,
-            format!("{} · two", &ids[1].to_string()[..7])
+            format!("{} · two · by T. Ester", &ids[1].to_string()[..7])
         );
-        assert_eq!(pointer.after, format!("{} · one", &ids[0].to_string()[..7]));
+        assert_eq!(
+            pointer.after,
+            format!("{} · one · by T. Ester", &ids[0].to_string()[..7])
+        );
         let checkout = shown
             .iter()
             .find(|c| c.name.contains("sub · branch / checkout commit"))
             .unwrap();
         assert_eq!(
             checkout.after,
-            format!("detached @ {} · one", &ids[0].to_string()[..7])
+            format!(
+                "detached @ {} · one · by T. Ester",
+                &ids[0].to_string()[..7]
+            )
         );
         let action = shown
             .iter()
@@ -1234,7 +1245,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             action.before,
-            format!("Requested: {} · one", &ids[0].to_string()[..7])
+            format!(
+                "Requested: {} · one · by T. Ester",
+                &ids[0].to_string()[..7]
+            )
         );
         assert!(
             changes.iter().any(|c| c.after == ids[0].to_string()),
@@ -1272,15 +1286,21 @@ mod tests {
         let full = ids[0].to_string();
         assert_eq!(
             display_commit_text(temp.path(), ".", &format!("Applied commit {full}!")),
-            format!("Applied commit {} · Trial title λ!", &full[..7])
+            format!(
+                "Applied commit {} · Trial title λ · by T. Ester!",
+                &full[..7]
+            )
         );
         assert_eq!(
             display_commit_text(temp.path(), "missing", &full),
-            format!("{} · (title unavailable)", &full[..7])
+            format!(
+                "{} · (title unavailable) · by (author unavailable)",
+                &full[..7]
+            )
         );
         assert_eq!(
             display_commit_text(temp.path(), ".", &"1".repeat(40)),
-            "1111111 · (title unavailable)"
+            "1111111 · (title unavailable) · by (author unavailable)"
         );
         for text in ["absent", "unborn", "normal text", "λ", "abc123", ""] {
             assert_eq!(display_commit_text(temp.path(), ".", text), text);
@@ -1290,6 +1310,37 @@ mod tests {
             format!("{full}a"),
             "longer hex tokens are not commit IDs"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn commit_display_uses_the_author_not_the_committer_and_omits_emails() -> Result<()> {
+        let temp = TempDir::new("repository-display-author")?;
+        let (repo, ids) = fixture::make_history(temp.path(), &["initial"])?;
+        let parent = repo.find_commit(ids[0])?;
+        let author = git2::Signature::new(
+            "Zoë Driverless",
+            "author@example.com",
+            &git2::Time::new(fixture::BASE_TIME + 60, 0),
+        )?;
+        let committer = fixture::sig_at(fixture::BASE_TIME + 120)?;
+        let id = repo.commit(
+            None,
+            &author,
+            &committer,
+            "Steering trial",
+            &parent.tree()?,
+            &[&parent],
+        )?;
+        let shown = display_commit_text(temp.path(), ".", &id.to_string());
+        assert_eq!(
+            shown,
+            format!(
+                "{} · Steering trial · by Zoë Driverless",
+                &id.to_string()[..7]
+            )
+        );
+        assert!(!shown.contains("T. Ester") && !shown.contains("example.com"));
         Ok(())
     }
 

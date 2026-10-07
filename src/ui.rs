@@ -168,7 +168,7 @@ fn draw_normal(f: &mut Frame, app: &mut App) {
         draw_branch_popup(f, app);
     }
     if app.save_popup.is_some() {
-        draw_save_popup(f, app);
+        draw_save_popup(f, app, rows[1]);
     }
     if app.global_history.is_some() {
         draw_global_history(f, app, rows[1]);
@@ -281,7 +281,7 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
     } else if app.save_popup.is_some() {
         vec![
             if matches!(app.save_popup, Some(SaveStage::Confirm(_))) {
-                "n revise note · Enter apply · Esc/q cancel"
+                "↑↓/kj/PgUp/PgDn/Home/End scroll · n revise note · Enter apply · Esc/q cancel"
             } else {
                 "Enter/Esc/q close results"
             }
@@ -349,7 +349,7 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
     } else {
         vec![
             global.into(),
-            "Move: ↑↓/kj · PgUp/PgDn · Home/End · Tab/Shift+Tab/←→ panes".into(),
+            "Move: ↑↓/kj · PgUp/PgDn page/text · Home/End · Tab/Shift+Tab/←→ panes".into(),
             if app.view == View::Configurations {
                 "Enter edit config · p pull module · h global history · r refresh · n remote results · ? help · q/Esc/Ctrl+Q quit"
                     .into()
@@ -861,10 +861,19 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         match browser.display_comparison() {
             Ok(changes) => {
-                browser.diff_scroll = browser.diff_scroll.min(changes.len().saturating_sub(1));
+                let lines = wrap_lines(change_lines(&changes, 0), changes_area.width);
+                browser.diff_scroll = browser.diff_scroll.min(
+                    lines
+                        .len()
+                        .saturating_sub(changes_area.height.max(1) as usize),
+                );
                 f.render_widget(
-                    Paragraph::new(change_lines(&changes, browser.diff_scroll))
-                        .wrap(Wrap { trim: false }),
+                    Paragraph::new(
+                        lines
+                            .into_iter()
+                            .skip(browser.diff_scroll)
+                            .collect::<Vec<_>>(),
+                    ),
                     changes_area,
                 );
             }
@@ -891,6 +900,26 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
     for (i, (label, hit)) in buttons.into_iter().enumerate() {
         draw_button(f, app, columns[i], label, hit, ButtonPos::Center);
     }
+}
+
+/// Wrap descriptions without ellipses, counting physical lines for scrolling.
+fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    let mut result = Vec::new();
+    for line in lines {
+        if line.width() <= width as usize {
+            result.push(line);
+        } else {
+            let text: String = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            let mut wrapped = wrapped_note("", &text, width);
+            wrapped.pop(); // No paragraph separator inside one description.
+            result.extend(wrapped.into_iter().map(|wrapped| wrapped.style(line.style)));
+        }
+    }
+    result
 }
 
 /// Pre-wrap note lines so scrolling counts visible lines, including long tokens.
@@ -1012,10 +1041,12 @@ fn draw_batch_review(f: &mut Frame, app: &mut App, area: Rect) {
         );
         lines.extend(change_lines(&file.changes, 0));
     }
-    review.scroll = review.scroll.min(lines.len().saturating_sub(1));
+    let lines = wrap_lines(lines, rows[1].width);
+    review.scroll = review
+        .scroll
+        .min(lines.len().saturating_sub(rows[1].height.max(1) as usize));
     f.render_widget(
-        Paragraph::new(lines.into_iter().skip(review.scroll).collect::<Vec<_>>())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(lines.into_iter().skip(review.scroll).collect::<Vec<_>>()),
         rows[1],
     );
     f.render_widget(Paragraph::new(vec![
@@ -1473,108 +1504,142 @@ fn draw_repos_pane(f: &mut Frame, app: &mut App, area: Rect) {
     app.hit_zones.push((area, Hit::PaneRepos));
 }
 
-/// The commit browser: a two-line summary of the selected entry plus its
-/// commit history, newest first.
+/// Commit descriptions use variable-height rows instead of truncating titles.
 fn draw_commits_pane(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width < 8 || area.height < 3 {
         return;
     }
     let focused = app.focus == Focus::Commits;
     let selected = app.repos.selected();
-
     let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(area);
     let summary: Vec<_> = summary_lines(app)
         .into_iter()
         .map(|line| ellipsize_line(line, chunks[0].width as usize))
         .collect();
     f.render_widget(Paragraph::new(summary), chunks[0]);
-
     let (title, empty_msg) = list_meta(app, selected);
     let block = Block::bordered()
         .title(ellipsize(
             &title,
-            (chunks[1].width as usize).saturating_sub(2),
+            chunks[1].width.saturating_sub(2) as usize,
         ))
         .border_style(pane_border(focused));
     let inner = block.inner(chunks[1]);
-
-    // Gather rows (immutable borrow of app), then render and register zones.
-    struct RowDraw {
-        line: Line<'static>,
-        selected: bool,
-        index: usize,
-    }
-    let rows: Vec<RowDraw> = match app.entries.get(selected) {
-        None => Vec::new(),
-        Some(entry) => {
-            let recorded = app.current_oid(selected);
-            let workdir = app.workdir_oid(selected);
-            let (offset, count) = entry.scroll.visible(inner.height as usize);
-            (offset..offset + count)
-                .map(|i| {
-                    let is_selected = entry.scroll.selected() == i;
-                    match entry
-                        .visible
-                        .get(i)
-                        .and_then(|&original| entry.log.get(original))
-                    {
-                        Some(c) => {
-                            let (marker, color) = if entry.pick == Some(c.oid) {
-                                ('✓', PICKED)
-                            } else if recorded == Some(c.oid) {
-                                ('●', CURRENT)
-                            } else if selected > 0 && Some(c.oid) == workdir {
-                                ('○', MUTED)
-                            } else {
-                                (' ', Color::Reset)
-                            };
-                            let mut spans = vec![
-                                Span::styled(marker.to_string(), Style::new().fg(color)),
-                                Span::raw(" "),
-                                Span::styled(c.short_sha.clone(), Style::new().fg(CURRENT)),
-                                Span::raw(" "),
-                                Span::styled(c.time_str(), Style::new().fg(MUTED)),
-                                Span::raw(" "),
-                            ];
-                            let title_width = (inner.width as usize)
-                                .saturating_sub(Line::from(spans.clone()).width());
-                            spans.push(Span::raw(ellipsize(&c.title, title_width)));
-                            let line = Line::from(spans);
-                            RowDraw {
-                                line,
-                                selected: is_selected,
-                                index: i,
-                            }
-                        }
-                        None => RowDraw {
-                            line: Line::from("…").dim(),
-                            selected: is_selected,
-                            index: i,
-                        },
-                    }
-                })
-                .collect()
-        }
-    };
-
     f.render_widget(block, chunks[1]);
     app.pane_heights.commits = inner.height as usize;
     app.hit_zones.push((chunks[1], Hit::PaneCommits));
-
     if let Some(msg) = empty_msg {
         f.render_widget(Paragraph::new(msg).dim().wrap(Wrap { trim: true }), inner);
         return;
     }
-
-    for (row, r) in rows.into_iter().enumerate() {
-        let rect = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
-        let style = if r.selected {
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+    let recorded = app.current_oid(selected);
+    let workdir = app.workdir_oid(selected);
+    struct RowDraw {
+        lines: Vec<Line<'static>>,
+        index: usize,
+        selected: bool,
+    }
+    let Some(entry) = app.entries.get(selected) else {
+        return;
+    };
+    let selected_row = entry.scroll.selected();
+    let describe = |index: usize| {
+        let Some(c) = entry
+            .visible
+            .get(index)
+            .and_then(|&original| entry.log.get(original))
+        else {
+            return vec![Line::from("…").dim()];
+        };
+        let (marker, color) = if entry.pick == Some(c.oid) {
+            ('✓', PICKED)
+        } else if recorded == Some(c.oid) {
+            ('●', CURRENT)
+        } else if selected > 0 && Some(c.oid) == workdir {
+            ('○', MUTED)
+        } else {
+            (' ', Color::Reset)
+        };
+        let author = if c.author_name.trim().is_empty() {
+            "(author unavailable)"
+        } else {
+            &c.author_name
+        };
+        wrap_lines(
+            vec![
+                Line::from(vec![
+                    Span::styled(marker.to_string(), Style::new().fg(color)),
+                    Span::raw(" "),
+                    Span::styled(c.short_sha.clone(), Style::new().fg(CURRENT)),
+                    Span::raw(" "),
+                    Span::styled(c.time_str(), Style::new().fg(MUTED)),
+                ]),
+                Line::from(format!(
+                    "{} · by {}",
+                    safe_text(&c.title),
+                    safe_text(author)
+                )),
+            ],
+            inner.width,
+        )
+    };
+    let viewport = inner.height as usize;
+    let selected_height = describe(selected_row).len();
+    let text_scroll = entry
+        .commit_text_scroll
+        .min(selected_height.saturating_sub(viewport));
+    // Keep the selected commit fully visible whenever it fits; account for real row heights.
+    let mut offset = selected_row;
+    let mut used = selected_height.min(viewport);
+    while offset > entry.scroll.offset().min(selected_row) {
+        let height = describe(offset - 1).len();
+        if used + height > viewport {
+            break;
+        }
+        used += height;
+        offset -= 1;
+    }
+    let mut rows = Vec::new();
+    let mut used = 0;
+    for index in offset..entry.visible.len() {
+        let mut lines = describe(index);
+        if index == selected_row {
+            lines = lines.into_iter().skip(text_scroll).collect();
+        }
+        let visible_height = lines.len().min(viewport - used);
+        if visible_height == 0 {
+            break;
+        }
+        lines.truncate(visible_height);
+        used += visible_height;
+        rows.push(RowDraw {
+            lines,
+            index,
+            selected: index == selected_row,
+        });
+        if used == viewport {
+            break;
+        }
+    }
+    let entry = &mut app.entries[selected];
+    entry.scroll.set_offset(offset);
+    entry.commit_text_height = selected_height;
+    entry.commit_text_scroll = text_scroll;
+    entry.commit_page = rows.len().max(1);
+    let mut y = inner.y;
+    for row in rows {
+        let rect = Rect::new(inner.x, y, inner.width, row.lines.len() as u16);
+        y += rect.height;
+        let style = if row.selected {
             selected_style(focused)
         } else {
             Style::new()
         };
-        f.render_widget(Paragraph::new(r.line).style(style), rect);
-        app.hit_zones.push((rect, Hit::CommitRow(r.index)));
+        f.render_widget(Paragraph::new(row.lines).style(style), rect);
+        app.hit_zones.push((rect, Hit::CommitRow(row.index)));
     }
 }
 
@@ -1755,7 +1820,7 @@ fn pick_line(app: &App, idx: usize) -> Line<'static> {
                 format!("  {}", c.time_str()),
                 Style::new().fg(MUTED),
             ));
-            spans.push(Span::raw(format!("  {}", c.title)));
+            // The full title/author lives in the wrapped commit row and save preview.
         }
         None => spans.push(dim("  (beyond loaded history)")),
     }
@@ -1911,8 +1976,7 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
 
 /// The save popup (`s`): confirmation listing every planned change, then the
 /// apply result. All controls are keyboard-only.
-fn draw_save_popup(f: &mut Frame, app: &mut App) {
-    let area = f.area();
+fn draw_save_popup(f: &mut Frame, app: &mut App, area: Rect) {
     if area.width < 20 || area.height < 7 {
         return;
     }
@@ -1921,8 +1985,7 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
     struct ChangeView {
         name: String,
         old: String,
-        new: String,
-        title: Option<String>,
+        description: String,
         warn: Option<String>,
     }
     enum View {
@@ -1939,8 +2002,30 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
                 .map(|c| ChangeView {
                     name: c.name.clone(),
                     old: c.current.map(short_oid).unwrap_or_else(|| "—".into()),
-                    new: short_oid(c.pick),
-                    title: c.title.clone(),
+                    description: app.overview.as_ref().map_or_else(
+                        || {
+                            format!(
+                                "{} · {}",
+                                short_oid(c.pick),
+                                c.title.as_deref().unwrap_or("(title unavailable)")
+                            )
+                        },
+                        |overview| {
+                            let module = if c.idx == 0 {
+                                "."
+                            } else {
+                                overview
+                                    .submodules
+                                    .get(c.idx - 1)
+                                    .map_or(".", |module| module.path.as_str())
+                            };
+                            crate::repository_history::display_commit_text(
+                                &overview.root,
+                                module,
+                                &c.pick.to_string(),
+                            )
+                        },
+                    ),
                     warn: c.dirty_warning.clone(),
                 })
                 .collect(),
@@ -1955,112 +2040,84 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
     match &view {
         View::Confirm(changes) => {
             let n = changes.len();
-            let shown = n.min(8);
-            let extra = n - shown;
-            let warns: Vec<&str> = changes.iter().filter_map(|c| c.warn.as_deref()).collect();
-
-            let mut constraints: Vec<Constraint> = Vec::new();
-            constraints.extend(std::iter::repeat_n(Constraint::Length(1), shown));
-            if extra > 0 {
-                constraints.push(Constraint::Length(1));
-            }
-            constraints.extend(std::iter::repeat_n(Constraint::Length(1), warns.len()));
-            let note_lines = action_note_lines(app, area.width.saturating_sub(4).min(56));
-            constraints.push(Constraint::Length(note_lines.len() as u16));
-            constraints.push(Constraint::Length(1)); // buttons
-
-            let title = if n == 1 {
-                " Save — apply 1 change? ".to_string()
-            } else {
-                format!(" Save — apply {n} changes? ")
-            };
-            let popup = centered_fixed(
-                60,
-                constraints.len() as u16 + 2 + note_lines.len().saturating_sub(1) as u16,
-                area,
-            );
-            f.render_widget(Clear, popup);
-            let block = Block::bordered()
-                .title(title)
-                .border_style(Style::new().fg(ACCENT));
-            let inner = block.inner(popup);
-            f.render_widget(block, popup);
-            app.hit_zones.push((popup, Hit::SavePopup));
-
-            let rows = Layout::vertical(constraints).split(inner);
-            let mut r = 0;
-            for c in changes.iter().take(shown) {
-                let reserved = UnicodeWidthStr::width("  ")
-                    + UnicodeWidthStr::width(c.old.as_str())
-                    + UnicodeWidthStr::width(" → ")
-                    + UnicodeWidthStr::width(c.new.as_str());
-                let name_width = (rows[r].width as usize).saturating_sub(reserved);
-                let mut spans = vec![
+            let width = area.width.min(60).saturating_sub(2);
+            let mut lines = Vec::new();
+            for c in changes {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.push(Line::from(vec![
                     Span::styled(
-                        ellipsize(&c.name, name_width),
+                        safe_text(&c.name),
                         Style::new().add_modifier(Modifier::BOLD),
                     ),
                     dim("  "),
                     Span::styled(c.old.clone(), Style::new().fg(CURRENT)),
-                    dim(" → "),
-                    Span::styled(c.new.clone(), Style::new().fg(PICKED)),
-                ];
-                if let Some(t) = &c.title {
-                    spans.push(dim(format!("  {t}")));
+                    dim(" →"),
+                ]));
+                lines.push(Line::from(safe_text(&c.description)).fg(PICKED));
+                if let Some(warning) = &c.warn {
+                    lines.push(Line::from(format!("⚠ {}", safe_text(warning))).fg(WARNING));
                 }
-                f.render_widget(
-                    Paragraph::new(ellipsize_line(Line::from(spans), rows[r].width as usize)),
-                    rows[r],
+            }
+            if n == 0 {
+                lines.push(Line::from("nothing picked yet — pick commits with Enter").dim());
+            }
+            let lines = wrap_lines(lines, width);
+            let note_lines = action_note_lines(app, width);
+            let height = (lines.len() + note_lines.len() + 3).min(area.height as usize);
+            let popup = centered_fixed(60, height as u16, area);
+            f.render_widget(Clear, popup);
+            let block = Block::bordered()
+                .title(format!(
+                    " Save — apply {n} change{}? ",
+                    if n == 1 { "" } else { "s" }
+                ))
+                .border_style(Style::new().fg(ACCENT));
+            let inner = block.inner(popup);
+            f.render_widget(block, popup);
+            app.hit_zones.push((popup, Hit::SavePopup));
+            let rows = Layout::vertical([
+                Constraint::Min(0),
+                Constraint::Length(note_lines.len() as u16),
+                Constraint::Length(1),
+            ])
+            .split(inner);
+            app.pane_heights.save = rows[0].height as usize;
+            app.save_scroll = app
+                .save_scroll
+                .min(lines.len().saturating_sub(rows[0].height.max(1) as usize));
+            f.render_widget(
+                Paragraph::new(lines.into_iter().skip(app.save_scroll).collect::<Vec<_>>()),
+                rows[0],
+            );
+            f.render_widget(Paragraph::new(note_lines).fg(CURRENT), rows[1]);
+            if n == 0 {
+                draw_button(
+                    f,
+                    app,
+                    rows[2],
+                    "[ Cancel ]",
+                    Hit::SaveCancel,
+                    ButtonPos::Center,
                 );
-                r += 1;
-            }
-            if extra > 0 {
-                f.render_widget(Paragraph::new(format!("… and {extra} more")).dim(), rows[r]);
-                r += 1;
-            }
-            for w in warns {
-                f.render_widget(
-                    Paragraph::new(ellipsize(&format!("⚠ {w}"), rows[r].width as usize))
-                        .style(Style::new().fg(CURRENT)),
-                    rows[r],
+            } else {
+                draw_button(
+                    f,
+                    app,
+                    rows[2],
+                    "[ Apply ]",
+                    Hit::SaveApply,
+                    ButtonPos::Left,
                 );
-                r += 1;
-            }
-            f.render_widget(Paragraph::new(note_lines).fg(CURRENT), rows[r]);
-            r += 1;
-
-            if rows[r].height > 0 {
-                if n == 0 {
-                    f.render_widget(
-                        Paragraph::new("nothing picked yet — pick commits with Enter").dim(),
-                        rows[0],
-                    );
-                    draw_button(
-                        f,
-                        app,
-                        rows[r],
-                        "[ Cancel ]",
-                        Hit::SaveCancel,
-                        ButtonPos::Center,
-                    );
-                } else {
-                    draw_button(
-                        f,
-                        app,
-                        rows[r],
-                        "[ Apply ]",
-                        Hit::SaveApply,
-                        ButtonPos::Left,
-                    );
-                    draw_button(
-                        f,
-                        app,
-                        rows[r],
-                        "[ Cancel ]",
-                        Hit::SaveCancel,
-                        ButtonPos::Right,
-                    );
-                }
+                draw_button(
+                    f,
+                    app,
+                    rows[2],
+                    "[ Cancel ]",
+                    Hit::SaveCancel,
+                    ButtonPos::Right,
+                );
             }
         }
         View::Result { applied, failed } => {
@@ -2234,7 +2291,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         ("Ctrl+P,P", "confirm fetch and fast-forward all repos"),
         ("p", "pull only selected repository/module"),
         ("↑ ↓ / k j", "move selection"),
-        ("PgUp PgDn / Home End", "scroll by page / first-last"),
+        (
+            "PgUp PgDn / Home End",
+            "page commits/long descriptions · first-last",
+        ),
         ("Tab / Shift+Tab", "switch pane (repos ↔ commits)"),
         ("Enter", "pick / un-pick recorded commit"),
         ("b", "local/remote branch picker (f fetches)"),
@@ -2539,7 +2599,7 @@ mod tests {
     }
 
     #[test]
-    fn history_changes_and_restore_review_show_short_commit_hashes_and_titles() {
+    fn history_changes_and_restore_review_show_short_hashes_titles_and_authors() {
         let (mut app, _temp) = make_branchy_app();
         let commit = app
             .repo
@@ -2550,7 +2610,12 @@ mod tests {
             .peel_to_commit()
             .unwrap();
         let full = commit.id().to_string();
-        let description = format!("{} · {}", &full[..7], commit.summary().unwrap());
+        let description = format!(
+            "{} · {} · by {}",
+            &full[..7],
+            commit.summary().unwrap(),
+            commit.author().name().unwrap()
+        );
         drop(commit);
         app.handle_key(key(KeyCode::Char('b')));
         crate::fixture::confirm_action(&mut app);
@@ -2579,6 +2644,45 @@ mod tests {
             "restore preview uses the same display: {text}"
         );
         assert!(!text.contains(&full));
+    }
+
+    #[test]
+    fn history_and_restore_scroll_to_end_of_wrapped_commit_descriptions() {
+        let temp = TempDir::new("ui-wrapped-history").unwrap();
+        let title = format!("{}description-end", "long description ".repeat(100));
+        let (repo, _) = fixture::make_history(&temp.path().join("repo"), &[&title]).unwrap();
+        let commit = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &commit, false).unwrap();
+        drop(commit);
+        let ov = gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+        app.handle_key(key(KeyCode::Char('b')));
+        crate::fixture::confirm_action(&mut app);
+        app.handle_key(key(KeyCode::Char('h')));
+        render(&mut app, 90, 30);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::End));
+        let buf = render(&mut app, 90, 30);
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::HistoryChanges).then_some(*rect))
+            .unwrap();
+        let text = rect_text(&buf, rect);
+        assert!(text.contains("description-end"), "{text}");
+        assert!(text.contains("· by"), "{text}");
+        assert!(!text.contains('…'));
+        assert!(app.global_history.as_ref().unwrap().diff_scroll > 0);
+        app.handle_key(key(KeyCode::Char('b'))); // restore previous branch
+        app.handle_key(key(KeyCode::Char('r')));
+        assert!(app.batch_review.is_some());
+        app.handle_paste("Review description");
+        app.handle_key(key(KeyCode::Enter)); // finish required note
+        app.handle_key(key(KeyCode::End));
+        let text = screen_text(&render(&mut app, 90, 30));
+        assert!(text.contains("description-end"), "{text}");
+        assert!(text.contains("· by"), "{text}");
+        assert!(app.batch_review.as_ref().unwrap().scroll > 0);
     }
 
     fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
@@ -3352,7 +3456,7 @@ mod tests {
     }
 
     #[test]
-    fn long_paths_and_titles_show_ellipsis_without_hiding_state() {
+    fn long_paths_ellipsize_but_commit_descriptions_wrap() {
         let temp = TempDir::new("ui-long-title").unwrap();
         let title = "a very long commit title that runs beyond the terminal width";
         let (repo, _) = fixture::make_history(&temp.path().join("repo"), &[title]).unwrap();
@@ -3361,13 +3465,184 @@ mod tests {
         app.overview.as_mut().unwrap().root =
             std::path::PathBuf::from(format!("/{}", "very-long-directory-name/".repeat(7)));
 
-        let buf = render(&mut app, 50, 15);
+        let buf = render(&mut app, 50, 24);
         let text = screen_text(&buf);
         let header = text.lines().next().unwrap();
-        let commit = text.lines().nth(4).unwrap();
         assert!(header.contains('…') && header.contains("main"), "{header}");
-        assert!(commit.contains('…'), "{commit}");
-        assert!(!commit.contains(title), "{commit}");
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::CommitRow(0)).then_some(*rect))
+            .unwrap();
+        let commit = rect_text(&buf, rect);
+        assert!(rect.height > 1);
+        assert!(!commit.contains('…'), "{commit}");
+        let normalized = commit.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains(title), "{normalized}");
+        assert!(normalized.contains("· by"), "{normalized}");
+    }
+
+    fn rect_text(buf: &ratatui::buffer::Buffer, rect: Rect) -> String {
+        (rect.y..rect.bottom())
+            .map(|y| {
+                (rect.x..rect.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn oversized_commit_description_pages_to_author_and_resets_on_selection() {
+        let temp = TempDir::new("ui-wrapped-paging").unwrap();
+        let title = format!("{}description-end", "東京 long description ".repeat(80));
+        let (repo, _) =
+            fixture::make_history(&temp.path().join("repo"), &["older", &title]).unwrap();
+        let ov = gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+        render(&mut app, 50, 20);
+        assert!(app.entries[0].commit_text_height > app.pane_heights.commits);
+        let mut pages = String::new();
+        for _ in 0..100 {
+            app.handle_key(key(KeyCode::PageDown));
+            assert_eq!(app.entries[0].scroll.selected(), 0);
+            let buf = render(&mut app, 50, 20);
+            let rect = app
+                .hit_zones
+                .iter()
+                .find_map(|(rect, hit)| (*hit == Hit::CommitRow(0)).then_some(*rect))
+                .unwrap();
+            pages.push_str(&rect_text(&buf, rect));
+            if app.entries[0].commit_text_scroll
+                == app.entries[0].commit_text_height - app.pane_heights.commits
+            {
+                break;
+            }
+        }
+        assert!(pages.contains("description-end"), "{pages}");
+        assert!(pages.contains("· by"), "{pages}");
+        assert!(!pages.contains('…'));
+        app.handle_key(key(KeyCode::PageUp));
+        assert!(
+            app.entries[0].commit_text_scroll
+                < app.entries[0].commit_text_height - app.pane_heights.commits
+        );
+        app.handle_key(key(KeyCode::Down));
+        let buf = render(&mut app, 50, 20);
+        assert_eq!(app.entries[0].scroll.selected(), 1);
+        assert_eq!(app.entries[0].commit_text_scroll, 0);
+        assert!(screen_text(&buf).contains("older"));
+        app.handle_key(key(KeyCode::Up));
+        render(&mut app, 120, 40);
+        assert_eq!(app.entries[0].commit_text_scroll, 0);
+    }
+
+    #[test]
+    fn save_preview_wraps_and_scrolls_full_commit_title_and_author() {
+        let temp = TempDir::new("ui-wrapped-save").unwrap();
+        let title = format!("{}description-end", "long description ".repeat(80));
+        let (repo, _) =
+            fixture::make_history(&temp.path().join("repo"), &[&title, "newer"]).unwrap();
+        let ov = gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Char('s')));
+        let initial = screen_text(&render(&mut app, 50, 20));
+        assert!(initial.contains("long description"), "{initial}");
+        assert!(app.action_note_editing);
+        app.handle_paste("Review wrapping");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::End));
+        let buf = render(&mut app, 50, 20);
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::SavePopup).then_some(*rect))
+            .unwrap();
+        let text = rect_text(&buf, rect);
+        assert!(text.contains("description-end"), "{text}");
+        assert!(text.contains("· by"), "{text}");
+        assert!(!text.contains('…'), "{text}");
+        assert!(text.contains("[ Apply ]"));
+        assert!(text.contains("Review wrapping"));
+        assert!(screen_text(&buf).contains("scroll · n revise note"));
+        assert!(matches!(app.save_popup, Some(SaveStage::Confirm(_))));
+        assert!(app.save_scroll > 0);
+        app.handle_key(key(KeyCode::Home));
+        render(&mut app, 50, 20);
+        assert_eq!(app.save_scroll, 0);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(
+            app.repo
+                .as_ref()
+                .unwrap()
+                .head()
+                .unwrap()
+                .peel_to_commit()
+                .unwrap()
+                .summary(),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn save_preview_can_scroll_through_every_repository_in_a_large_batch() {
+        let temp = TempDir::new("ui-large-save").unwrap();
+        let (repo, commits) =
+            fixture::make_history(&temp.path().join("repo"), &["commit title"]).unwrap();
+        let ov = gitx::overview(&repo).unwrap();
+        let mut app = App::normal(ov, repo);
+        app.save_popup = Some(SaveStage::Confirm(
+            (0..12)
+                .map(|i| SaveChange {
+                    idx: 0,
+                    name: format!("repository-{i}"),
+                    current: None,
+                    pick: commits[0],
+                    title: Some("commit title".into()),
+                    dirty_warning: None,
+                })
+                .collect(),
+        ));
+        render(&mut app, 80, 24);
+        app.handle_key(key(KeyCode::End));
+        let buf = render(&mut app, 80, 24);
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::SavePopup).then_some(*rect))
+            .unwrap();
+        let text = rect_text(&buf, rect);
+        assert!(text.contains("repository-11"), "{text}");
+        assert!(text.contains("commit title · by"), "{text}");
+        assert!(!text.contains('…'));
+        app.handle_key(key(KeyCode::PageUp));
+        let previous = app.save_scroll;
+        render(&mut app, 80, 24);
+        assert_eq!(previous, app.save_scroll);
+        app.handle_key(key(KeyCode::Home));
+        let text = screen_text(&render(&mut app, 80, 24));
+        assert!(text.contains("repository-0"), "{text}");
+    }
+
+    #[test]
+    fn wrapped_descriptions_preserve_unicode_and_diff_colors() {
+        let description = "東京大阪e\u{301}clair".repeat(12);
+        let lines = wrap_lines(vec![Line::from(description.clone()).fg(PICKED)], 9);
+        assert!(lines.len() > 1);
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.width() <= 9 && line.style.fg == Some(PICKED))
+        );
+        let text = lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, description);
     }
 
     #[test]
