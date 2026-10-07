@@ -444,13 +444,14 @@ impl Form {
         self.save_with_note("")
     }
 
-    fn save_with_note(&mut self, note: &str) -> Result<()> {
+    pub fn save_with_note(&mut self, note: &str) -> Result<()> {
         self.commit_input()?;
         let text = self.text()?;
         if text == self.original {
             self.notice = "No changes to save".into();
             return Ok(());
         }
+        crate::session::require_note(note)?;
         let store = self.store()?;
         self.notice = store.save(
             &self.path,
@@ -489,10 +490,11 @@ impl Form {
         self.overlay = Some(Overlay::Save {
             changes: self.changes(),
             note: String::new(),
-            note_editing: false,
+            note_editing: true,
             scroll: 0,
         });
-        self.notice = "Review changes; Enter confirms, Esc returns to editing".into();
+        self.notice =
+            "Write a required note, then Enter finishes it; Enter again confirms the save".into();
         Ok(())
     }
 
@@ -659,7 +661,14 @@ impl Form {
             } => {
                 if *note_editing {
                     match code {
-                        KeyCode::Enter | KeyCode::Esc => *note_editing = false,
+                        KeyCode::Enter => {
+                            if let Err(e) = crate::session::require_note(note) {
+                                self.notice = e.to_string();
+                            } else {
+                                *note_editing = false;
+                            }
+                        }
+                        KeyCode::Esc => close = true,
                         KeyCode::Backspace => {
                             note.pop();
                         }
@@ -683,7 +692,12 @@ impl Form {
                                 close = true;
                                 saved = true;
                             }
-                            Err(e) => self.notice = format!("{e:#}"),
+                            Err(e) => {
+                                self.notice = format!("{e:#}");
+                                if crate::session::require_note(note).is_err() {
+                                    *note_editing = true;
+                                }
+                            }
                         },
                         KeyCode::Esc | KeyCode::Char('q') => close = true,
                         KeyCode::Char('n') => *note_editing = true,
@@ -1284,7 +1298,7 @@ mod tests {
         f.activate();
         f.paste("9");
         f.commit_input()?;
-        f.save()?;
+        f.save_with_note("Test config change")?;
         assert_eq!(
             fs::read_to_string(&f.path)?,
             original
@@ -1296,7 +1310,7 @@ mod tests {
         f.scroll.select(0);
         f.activate();
         f.paste("3.0");
-        f.save()?;
+        f.save_with_note("Test config change")?;
         assert!(fs::read_to_string(&f.path)?.contains("gain: 3.0"));
         Ok(())
     }
@@ -1307,7 +1321,7 @@ mod tests {
         f.activate();
         f.paste("1.5");
         assert!(f.commit_input().is_err());
-        assert!(f.save().is_err());
+        assert!(f.save_with_note("Test config change").is_err());
         assert_eq!(
             fs::read_to_string(&f.path)?,
             "count: 1\ngain: 1.0\nname: original\n"
@@ -1321,7 +1335,7 @@ mod tests {
         f.scroll.select(2);
         f.activate();
         f.paste("true # [something]: null");
-        f.save()?;
+        f.save_with_note("Test config change")?;
         let yaml = YamlLoader::load_from_str(&fs::read_to_string(&f.path)?)?;
         assert_eq!(yaml[0]["name"].as_str(), Some("true # [something]: null"));
         assert_eq!(f.parameters[2].kind, Kind::Text);
@@ -1340,7 +1354,7 @@ mod tests {
         f.activate();
         f.paste("a'b");
         f.commit_input()?;
-        f.save()?;
+        f.save_with_note("Test config change")?;
         assert_eq!(
             fs::read_to_string(&f.path)?,
             original
@@ -1367,7 +1381,7 @@ mod tests {
         f.paste("2");
         f.commit_input()?;
         fs::write(&f.path, "count: 100\n")?;
-        assert!(f.save().is_err());
+        assert!(f.save_with_note("Test config change").is_err());
         assert_eq!(fs::read_to_string(&f.path)?, "count: 100\n");
         assert!(parameters("gain: 1\ngain: 2\n").is_err());
         assert!(parameters("gain: [1,\n").is_err());
@@ -1380,7 +1394,7 @@ mod tests {
         assert_eq!(f.parameters[0].kind, Kind::Boolean);
         assert_eq!(f.parameters[1].kind, Kind::Text);
         f.activate();
-        f.save()?;
+        f.save_with_note("Test config change")?;
         assert_eq!(
             fs::read_to_string(&f.path)?,
             "checked_on_default: true\nquoted: 'No'\n"
@@ -1435,10 +1449,9 @@ mod tests {
         f.overlay_key(KeyCode::Esc, KeyModifiers::NONE, 10);
         assert!(f.dirty());
         f.request_save()?;
-        f.overlay_key(KeyCode::Char('n'), KeyModifiers::NONE, 10);
         f.paste("Skidpad tuning λ");
-        f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10); // finish note
-        assert!(f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        crate::fixture::confirm_form(&mut f, KeyModifiers::NONE, 10); // finish note
+        assert!(crate::fixture::confirm_form(&mut f, KeyModifiers::NONE, 10));
         assert!(!f.dirty());
         let store = Store::open(&f.path)?;
         assert_eq!(store.list()?[0].note, "Skidpad tuning λ");
@@ -1447,7 +1460,7 @@ mod tests {
         let mut f = Form::open(path)?;
         f.activate();
         f.paste("3");
-        f.save()?;
+        f.save_with_note("Test config change")?;
         f.open_history()?;
         assert_eq!(f.history_comparison()?[0].before, "2");
         f.overlay_key(KeyCode::Up, KeyModifiers::NONE, 10);
@@ -1466,7 +1479,7 @@ mod tests {
             "restore is only pending"
         );
         f.request_save()?;
-        assert!(f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert!(crate::fixture::confirm_form(&mut f, KeyModifiers::NONE, 10));
         assert_eq!(fs::read_to_string(&f.path)?, "# keep this\ngain: 1\n");
         let entries = store.list()?;
         assert_eq!(entries.len(), 3);
@@ -1483,7 +1496,7 @@ mod tests {
         f.overlay_key(KeyCode::Char('b'), KeyModifiers::NONE, 10);
         f.overlay_key(KeyCode::Char('r'), KeyModifiers::NONE, 10); // undo the restore
         f.request_save()?;
-        f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10);
+        crate::fixture::confirm_form(&mut f, KeyModifiers::NONE, 10);
         assert_eq!(fs::read_to_string(&f.path)?, "# keep this\ngain: 3\n");
         assert_eq!(store.list()?.len(), 4);
         Ok(())
@@ -1494,7 +1507,7 @@ mod tests {
         let (_temp, mut f) = form("history-drift", "gain: 1\n")?;
         f.activate();
         f.paste("2");
-        f.save()?;
+        f.save_with_note("Test config change")?;
         fs::write(&f.path, "gain: 2\nnew_param: true\n")?;
         let mut f = Form::open(f.path)?;
         f.open_history()?;
@@ -1531,6 +1544,46 @@ mod tests {
     }
 
     #[test]
+    fn changed_configs_require_a_note_before_disk_or_history_writes() -> Result<()> {
+        let (_temp, mut f) = form("required-note", "gain: 1\n")?;
+        f.activate();
+        f.paste("2");
+        f.commit_input()?;
+        let store = Store::open(&f.path)?;
+        assert!(
+            f.save().is_err(),
+            "the note-free save API cannot bypass documentation"
+        );
+        for note in ["", "   ", "\u{a0}"] {
+            assert!(f.save_with_note(note).is_err());
+            assert_eq!(fs::read_to_string(&f.path)?, "gain: 1\n");
+            assert!(store.list()?.is_empty());
+        }
+        f.request_save()?;
+        assert!(!f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert!(matches!(
+            &f.overlay,
+            Some(Overlay::Save {
+                note_editing: true,
+                ..
+            })
+        ));
+        f.paste(" ");
+        f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10); // finish input
+        assert!(!f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert!(store.list()?.is_empty());
+        f.overlay_key(KeyCode::Char('u'), KeyModifiers::CONTROL, 10);
+        f.paste("λ");
+        f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10);
+        assert!(f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert_eq!(fs::read_to_string(&f.path)?, "gain: 2\n");
+        assert_eq!(store.list()?[0].note, "λ");
+        f.save()?; // Unchanged files need no note and create no new entry.
+        assert_eq!(store.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn history_and_review_do_not_accept_unvalidated_pastes_or_overwrite_dirty_edits() -> Result<()>
     {
         let (_temp, mut f) = form("history-modal", "gain: 1\n")?;
@@ -1548,7 +1601,11 @@ mod tests {
         f.paste("gain: 200\nnew: false");
         assert_eq!(f.changes()[0].after, "2");
         fs::write(&f.path, "gain: 9\n")?;
-        assert!(!f.overlay_key(KeyCode::Enter, KeyModifiers::NONE, 10));
+        assert!(!crate::fixture::confirm_form(
+            &mut f,
+            KeyModifiers::NONE,
+            10
+        ));
         assert!(f.overlay.is_some());
         assert_eq!(fs::read_to_string(&f.path)?, "gain: 9\n");
         Ok(())

@@ -253,7 +253,16 @@ pub struct Intent {
     pub kind: String,
     pub subject: String,
     pub requested: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub note: String,
+    /// One confirmation may apply to multiple repositories. Never group by text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_group: Option<String>,
     pub before: Vec<State>,
+}
+pub struct Annotation<'a> {
+    pub note: &'a str,
+    pub group: Option<&'a str>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Outcome {
@@ -282,18 +291,55 @@ impl Journal {
         subject: &str,
         requested: &str,
     ) -> Result<Self> {
-        let workspace = workspace_lock(root)?;
-        let mut journal = Self::begin_locked(root, session, kind, subject, requested)?;
-        journal._workspace = Some(workspace);
-        Ok(journal)
+        Self::begin_noted(root, session, kind, subject, requested, "")
     }
-    pub(crate) fn begin_locked(
+
+    pub fn begin_noted(
         root: &Path,
         session: &str,
         kind: &str,
         subject: &str,
         requested: &str,
+        note: &str,
     ) -> Result<Self> {
+        Self::begin_grouped(
+            root,
+            session,
+            kind,
+            subject,
+            requested,
+            &Annotation { note, group: None },
+        )
+    }
+
+    pub fn begin_grouped(
+        root: &Path,
+        session: &str,
+        kind: &str,
+        subject: &str,
+        requested: &str,
+        annotation: &Annotation<'_>,
+    ) -> Result<Self> {
+        let workspace = workspace_lock(root)?;
+        let mut journal =
+            Self::begin_grouped_locked(root, session, kind, subject, requested, annotation)?;
+        journal._workspace = Some(workspace);
+        Ok(journal)
+    }
+
+    fn begin_grouped_locked(
+        root: &Path,
+        session: &str,
+        kind: &str,
+        subject: &str,
+        requested: &str,
+        annotation: &Annotation<'_>,
+    ) -> Result<Self> {
+        let note = annotation.note;
+        crate::session::validate_note(note)?;
+        if let Some(group) = annotation.group {
+            crate::session::valid_id(group)?;
+        }
         let id = identifier()?;
         let before = stack(root, &[])
             .context("cannot capture the repository baseline; no Git action started")?;
@@ -307,6 +353,8 @@ impl Journal {
             kind: kind.into(),
             subject: subject.into(),
             requested: requested.into(),
+            note: note.into(),
+            note_group: annotation.group.map(str::to_owned),
             before,
         };
         let dir = base(root)?.join(&id);
@@ -347,7 +395,39 @@ pub fn run(
     requested: &str,
     action: impl FnOnce() -> Result<String>,
 ) -> Result<String> {
-    let journal = Journal::begin(root, session, kind, subject, requested)?;
+    run_noted(root, session, kind, subject, requested, "", action)
+}
+
+pub fn run_noted(
+    root: &Path,
+    session: &str,
+    kind: &str,
+    subject: &str,
+    requested: &str,
+    note: &str,
+    action: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    run_grouped(
+        root,
+        session,
+        kind,
+        subject,
+        requested,
+        &Annotation { note, group: None },
+        action,
+    )
+}
+
+pub fn run_grouped(
+    root: &Path,
+    session: &str,
+    kind: &str,
+    subject: &str,
+    requested: &str,
+    annotation: &Annotation<'_>,
+    action: impl FnOnce() -> Result<String>,
+) -> Result<String> {
+    let journal = Journal::begin_grouped(root, session, kind, subject, requested, annotation)?;
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(action)).unwrap_or_else(|_| {
             Err(anyhow::anyhow!(
@@ -369,6 +449,9 @@ fn read_event(dir: &Path) -> Result<Event> {
     }
     crate::session::valid_id(&intent.id)?;
     crate::session::valid_id(&intent.session)?;
+    if let Some(group) = &intent.note_group {
+        crate::session::valid_id(group)?;
+    }
     let (outcome, status) = if dir.join("outcome.json").exists() {
         let value: Outcome = read(&dir.join("outcome.json"))?;
         let status = if value.success {
@@ -512,6 +595,79 @@ pub fn changes(before: &State, after: &State, refs: bool) -> Vec<Change> {
         }
     }
     result
+}
+
+/// Presentation only: journal snapshots and restore targets keep full object IDs.
+pub fn display_changes(root: &Path, before: &State, after: &State, refs: bool) -> Vec<Change> {
+    let mut result = changes(before, after, refs);
+    for change in &mut result {
+        let name = change
+            .name
+            .strip_prefix(&format!("{} · ", before.module))
+            .unwrap_or("");
+        if name == "branch / checkout commit" {
+            change.before = display_head(root, &before.module, &before.head);
+            change.after = display_head(root, &after.module, &after.head);
+        } else {
+            // A gitlink's object belongs to the submodule, not its parent repository.
+            let module = if let Some(path) = name.strip_prefix("staged gitlink ") {
+                if before.module == "." {
+                    path.to_owned()
+                } else {
+                    format!("{}/{path}", before.module)
+                }
+            } else {
+                before.module.clone()
+            };
+            change.before = display_commit_text(root, &module, &change.before);
+            change.after = display_commit_text(root, &module, &change.after);
+        }
+    }
+    result
+}
+
+pub fn display_head(root: &Path, module: &str, head: &Head) -> String {
+    format!(
+        "{} @ {}",
+        head.branch.as_deref().unwrap_or("detached"),
+        display_commit_text(root, module, head.commit.as_deref().unwrap_or("unborn"))
+    )
+}
+
+/// Replace full commit IDs in action requests/results with a short ID and title.
+/// Missing/pruned objects still show their short ID without breaking history.
+pub fn display_commit_text(root: &Path, module: &str, text: &str) -> String {
+    let repo = open(root, module).ok();
+    let mut chars = text.chars().peekable();
+    let mut output = String::new();
+    while let Some(c) = chars.next() {
+        if !c.is_ascii_hexdigit() {
+            output.push(c);
+            continue;
+        }
+        let mut token = String::from(c);
+        while chars.peek().is_some_and(char::is_ascii_hexdigit) {
+            token.push(chars.next().unwrap());
+        }
+        if token.len() == 40 {
+            let title = token
+                .parse::<Oid>()
+                .ok()
+                .and_then(|oid| repo.as_ref()?.find_commit(oid).ok())
+                .map(|commit| {
+                    commit
+                        .summary()
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or("(no title)")
+                        .to_owned()
+                })
+                .unwrap_or_else(|| "(title unavailable)".into());
+            output.push_str(&format!("{} · {title}", &token[..7]));
+        } else {
+            output.push_str(&token);
+        }
+    }
+    output
 }
 
 #[derive(Clone)]
@@ -742,7 +898,12 @@ fn stage_links(repo: &Repository, links: &BTreeMap<String, String>) -> Result<()
     Ok(())
 }
 
-pub(crate) fn apply(root: &Path, session: &str, plan: &RepoPlan, note: &str) -> Result<()> {
+pub(crate) fn apply(
+    root: &Path,
+    session: &str,
+    plan: &RepoPlan,
+    annotation: &Annotation<'_>,
+) -> Result<()> {
     let current = capture(root, &plan.before.module)?;
     // Parent checkout may have changed gitlinks, but never this module's HEAD.
     if current.head != plan.before.head
@@ -758,12 +919,13 @@ pub(crate) fn apply(root: &Path, session: &str, plan: &RepoPlan, note: &str) -> 
         );
     }
     let repo = open(root, &current.module)?;
-    let journal = Journal::begin_locked(
+    let journal = Journal::begin_grouped_locked(
         root,
         session,
         "restore repository",
         &current.module,
-        &format!("{} · {note}", plan.source),
+        &plan.source,
+        annotation,
     )?;
     let result = (|| -> Result<String> {
         if current.head != plan.after.head {
@@ -973,7 +1135,7 @@ mod tests {
             "preview writes nothing"
         );
         let newer = Session::begin(temp.path(), SystemTime::now())?;
-        restore.confirm(temp.path(), &newer.id)?;
+        crate::fixture::confirm_restore(&mut restore, temp.path(), &newer.id)?;
         assert_eq!(repo.head()?.shorthand(), Some("main"));
         assert_eq!(repo.head()?.target(), Some(ids[1]));
         assert_eq!(
@@ -1003,7 +1165,7 @@ mod tests {
             let mut restore = review(temp.path(), &browser, true)?;
             assert!(restore.errors.is_empty(), "{:?}", restore.errors);
             assert!(restore.warnings.iter().any(|w| w.contains("will detach")));
-            restore.confirm(temp.path(), &session.id)?;
+            crate::fixture::confirm_restore(&mut restore, temp.path(), &session.id)?;
             assert!(repo.head_detached()?);
             assert_eq!(repo.head()?.target(), Some(ids[1]));
             assert_eq!(capture(temp.path(), ".")?.local_refs, refs);
@@ -1048,9 +1210,39 @@ mod tests {
                 .iter()
                 .any(|c| c.name.contains("sub · branch / checkout commit"))
         );
+        let shown = browser.display_comparison()?;
+        let pointer = shown
+            .iter()
+            .find(|c| c.name.contains("staged gitlink sub"))
+            .unwrap();
+        assert_eq!(
+            pointer.before,
+            format!("{} · two", &ids[1].to_string()[..7])
+        );
+        assert_eq!(pointer.after, format!("{} · one", &ids[0].to_string()[..7]));
+        let checkout = shown
+            .iter()
+            .find(|c| c.name.contains("sub · branch / checkout commit"))
+            .unwrap();
+        assert_eq!(
+            checkout.after,
+            format!("detached @ {} · one", &ids[0].to_string()[..7])
+        );
+        let action = shown
+            .iter()
+            .find(|c| c.before.starts_with("Requested:"))
+            .unwrap();
+        assert_eq!(
+            action.before,
+            format!("Requested: {} · one", &ids[0].to_string()[..7])
+        );
+        assert!(
+            changes.iter().any(|c| c.after == ids[0].to_string()),
+            "audit comparisons keep full IDs"
+        );
         let mut restore = review(temp.path(), &browser, true)?;
         assert!(restore.errors.is_empty(), "{:?}", restore.errors);
-        restore.confirm(temp.path(), &session.id)?;
+        crate::fixture::confirm_restore(&mut restore, temp.path(), &session.id)?;
         assert!(
             restore
                 .outcome
@@ -1070,6 +1262,34 @@ mod tests {
         );
         assert_eq!(open(temp.path(), "sub")?.head()?.target(), Some(ids[1]));
         assert!(!open(temp.path(), "sub")?.head_detached()?);
+        Ok(())
+    }
+
+    #[test]
+    fn commit_display_preserves_surrounding_text_and_handles_unavailable_objects() -> Result<()> {
+        let temp = TempDir::new("repository-display")?;
+        let (_, ids) = fixture::make_history(temp.path(), &["Trial title λ"])?;
+        let full = ids[0].to_string();
+        assert_eq!(
+            display_commit_text(temp.path(), ".", &format!("Applied commit {full}!")),
+            format!("Applied commit {} · Trial title λ!", &full[..7])
+        );
+        assert_eq!(
+            display_commit_text(temp.path(), "missing", &full),
+            format!("{} · (title unavailable)", &full[..7])
+        );
+        assert_eq!(
+            display_commit_text(temp.path(), ".", &"1".repeat(40)),
+            "1111111 · (title unavailable)"
+        );
+        for text in ["absent", "unborn", "normal text", "λ", "abc123", ""] {
+            assert_eq!(display_commit_text(temp.path(), ".", text), text);
+        }
+        assert_eq!(
+            display_commit_text(temp.path(), ".", &format!("{full}a")),
+            format!("{full}a"),
+            "longer hex tokens are not commit IDs"
+        );
         Ok(())
     }
 
@@ -1157,7 +1377,7 @@ mod tests {
         let mut restore = review(temp.path(), &browser, true)?;
         assert!(restore.errors.is_empty(), "{:?}", restore.errors);
         repo.reference("refs/remotes/example/main", ids[1], true, "external update")?;
-        assert!(restore.confirm(temp.path(), &session.id).is_err());
+        assert!(crate::fixture::confirm_restore(&mut restore, temp.path(), &session.id).is_err());
         assert_eq!(repo.head()?.target(), Some(ids[0]));
         let mut target = browser.repository_targets()?.remove(0);
         target.before.head.commit = Some("1111111111111111111111111111111111111111".into());
@@ -1257,6 +1477,8 @@ mod tests {
             Some(crate::network::Recording {
                 root: temp.path().into(),
                 session: session.id.clone(),
+                note: "Update modules for testing".into(),
+                note_group: crate::session::identifier()?,
             }),
         );
         loop {
@@ -1269,6 +1491,17 @@ mod tests {
         }
         let browser = Browser::open(temp.path())?;
         assert_eq!(browser.repository_events.len(), 2);
+        assert!(
+            browser
+                .repository_events
+                .iter()
+                .all(|event| event.intent.note == "Update modules for testing")
+        );
+        assert_eq!(browser.notes().len(), 1);
+        assert!(
+            browser.notes()[0].0.contains(". (completed)")
+                && browser.notes()[0].0.contains("uninitialized")
+        );
         assert_eq!(browser.visible.len(), 1);
         assert!(
             browser
@@ -1282,6 +1515,36 @@ mod tests {
                 .iter()
                 .any(|c| c.after.contains("not initialized"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ungrouped_legacy_actions_with_equal_notes_remain_separate() -> Result<()> {
+        let temp = TempDir::new("repository-legacy-notes")?;
+        fixture::make_history(temp.path(), &["one"])?;
+        let session = Session::begin(temp.path(), SystemTime::now())?;
+        for _ in 0..2 {
+            run_noted(
+                temp.path(),
+                &session.id,
+                "branch switch",
+                ".",
+                "main",
+                "Same note",
+                || Ok("Unchanged".into()),
+            )?;
+        }
+        session.finish()?;
+        let browser = Browser::open(temp.path())?;
+        assert_eq!(browser.notes().len(), 2);
+        for event in browser.repository_events {
+            assert!(event.intent.note_group.is_none());
+            let json = serde_json::to_value(&event.intent)?;
+            assert!(
+                json.get("note_group").is_none(),
+                "old journal serialization/checksums remain compatible"
+            );
+        }
         Ok(())
     }
 
@@ -1316,7 +1579,7 @@ mod tests {
         );
         let mut restore = review(&root, &browser, true)?;
         assert!(restore.errors.is_empty(), "{:?}", restore.errors);
-        restore.confirm(&root, &session.id)?;
+        crate::fixture::confirm_restore(&mut restore, &root, &session.id)?;
         let state = capture(&root, ".")?;
         assert_eq!(state.head.commit, Some(old.to_string()));
         assert!(state.head.branch.is_none());

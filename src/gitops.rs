@@ -18,26 +18,30 @@ use git2::{BranchType, ErrorCode, ObjectType, Repository};
 
 use crate::gitx::GITLINK_MODE;
 
-/// A local branch, as listed by [`branches`].
+/// A local or remote-tracking branch, as listed by [`branches`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BranchEntry {
     pub name: String,
     /// True when HEAD currently points at this branch.
     pub is_head: bool,
+    pub is_remote: bool,
 }
 
-/// List the repository's local branches in alphabetical order, with the
-/// current branch (if any) marked. Remote-tracking branches are excluded.
+/// List local branches first, then fetched remote branches (not symbolic HEADs).
 pub fn branches(repo: &Repository) -> Result<Vec<BranchEntry>> {
     let mut out = Vec::new();
-    for entry in repo.branches(Some(BranchType::Local))? {
-        let (branch, _) = entry?;
+    for entry in repo.branches(None)? {
+        let (branch, kind) = entry?;
+        if branch.get().symbolic_target().is_some() {
+            continue;
+        }
         out.push(BranchEntry {
             name: branch.name()?.unwrap_or("?").to_string(),
             is_head: branch.is_head(),
+            is_remote: kind == BranchType::Remote,
         });
     }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out.sort_by(|a, b| (a.is_remote, &a.name).cmp(&(b.is_remote, &b.name)));
     Ok(out)
 }
 
@@ -56,6 +60,54 @@ pub fn switch_branch(repo: &Repository, name: &str) -> Result<()> {
     repo.set_head(&format!("refs/heads/{name}"))
         .with_context(|| format!("moving HEAD to {what}"))?;
     Ok(())
+}
+
+/// Create a local tracking branch for an explicitly selected remote branch.
+/// Existing local branches are never overwritten or silently repointed.
+pub fn switch_remote_branch(repo: &Repository, name: &str) -> Result<()> {
+    if repo.state() != git2::RepositoryState::Clean {
+        return Err(anyhow!(
+            "resolve the in-progress Git operation before selecting a remote branch"
+        ));
+    }
+    let remotes = repo.remotes()?;
+    let remote = remotes
+        .iter()
+        .flatten()
+        .filter(|remote| {
+            name.strip_prefix(remote)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+        .max_by_key(|remote| remote.len())
+        .context("remote branch does not belong to a configured remote")?;
+    let local_name = name.strip_prefix(remote).unwrap().trim_start_matches('/');
+    if repo.find_branch(local_name, BranchType::Local).is_ok() {
+        return Err(anyhow!(
+            "local branch `{local_name}` already exists; select it instead (no branch overwritten)"
+        ));
+    }
+    let reference = repo.find_branch(name, BranchType::Remote)?;
+    let commit = reference.get().peel_to_commit()?;
+    let mut branch = repo.branch(local_name, &commit, false)?;
+    let result = branch
+        .set_upstream(Some(name))
+        .map_err(anyhow::Error::from)
+        .and_then(|()| switch_branch(repo, local_name));
+    if result.is_err() && !branch.is_head() {
+        // Roll back only the branch just created by this attempt, never an existing one.
+        if repo
+            .find_branch(local_name, BranchType::Local)?
+            .get()
+            .target()
+            != Some(commit.id())
+        {
+            return Err(anyhow!(
+                "switch failed and the new branch changed externally; branch retained, inspect Git status"
+            ));
+        }
+        branch.delete().context("switch failed and newly created tracking branch could not be removed; inspect Git status")?;
+    }
+    result
 }
 
 /// Move HEAD to `oid` as a detached checkout and update the working
@@ -372,15 +424,18 @@ mod tests {
             vec![
                 BranchEntry {
                     name: "feature".into(),
-                    is_head: false
+                    is_head: false,
+                    is_remote: false
                 },
                 BranchEntry {
                     name: "main".into(),
-                    is_head: true
+                    is_head: true,
+                    is_remote: false
                 },
                 BranchEntry {
                     name: "zeta".into(),
-                    is_head: false
+                    is_head: false,
+                    is_remote: false
                 },
             ]
         );
@@ -388,6 +443,67 @@ mod tests {
         // Unborn HEAD: no branches exist yet.
         let fresh = fixture::init_repo(&temp.path().join("fresh"), "main")?;
         assert!(branches(&fresh)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn remote_branches_create_tracking_branches_but_never_overwrite_local_branches() -> Result<()> {
+        let temp = TempDir::new("tracking-branches")?;
+        let (repo, ids) = varying_history(temp.path())?;
+        repo.remote("origin", "/unused/local/remote")?;
+        repo.reference(
+            "refs/remotes/origin/test/track",
+            ids[0],
+            false,
+            "test remote",
+        )?;
+        repo.reference_symbolic(
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/test/track",
+            false,
+            "test HEAD",
+        )?;
+        let entries = branches(&repo)?;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].name, "origin/test/track");
+        assert!(entries[1].is_remote && !entries[1].is_head);
+        assert!(!entries.iter().any(|b| b.name.ends_with("HEAD")));
+        let before = repo.head()?.target();
+        fs::write(temp.path().join("f.txt"), "local experiment\n")?;
+        assert!(switch_remote_branch(&repo, "origin/test/track").is_err());
+        assert_eq!(repo.head()?.target(), before);
+        assert!(repo.find_branch("test/track", BranchType::Local).is_err());
+        assert_eq!(
+            fs::read_to_string(temp.path().join("f.txt"))?,
+            "local experiment\n"
+        );
+        fs::write(temp.path().join("f.txt"), "two\n")?;
+        switch_remote_branch(&repo, "origin/test/track")?;
+        assert_eq!(repo.head()?.shorthand(), Some("test/track"));
+        assert_eq!(repo.head()?.target(), Some(ids[0]));
+        assert_eq!(
+            repo.find_branch("test/track", BranchType::Local)?
+                .upstream()?
+                .name()?,
+            Some("origin/test/track")
+        );
+        repo.reference(
+            "refs/remotes/origin/test/track",
+            ids[1],
+            true,
+            "remote advance",
+        )?;
+        assert!(
+            switch_remote_branch(&repo, "origin/test/track")
+                .unwrap_err()
+                .to_string()
+                .contains("already exists")
+        );
+        assert_eq!(
+            repo.head()?.target(),
+            Some(ids[0]),
+            "existing local branch never repointed"
+        );
         Ok(())
     }
 

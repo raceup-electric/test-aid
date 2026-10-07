@@ -9,6 +9,10 @@ use crate::term::Tui;
 use crate::ui;
 
 pub fn run(app: &mut App, terminal: &mut Tui) -> Result<()> {
+    // Crossterm installs its input source/SIGWINCH handler lazily. Establish it
+    // before drawing the first frame, so a resize immediately after startup is
+    // observed just like subsequent resizes.
+    event::poll(Duration::ZERO).context("initializing terminal input")?;
     let mut drawn_once = false;
     loop {
         app.poll_network();
@@ -31,7 +35,7 @@ pub fn run(app: &mut App, terminal: &mut Tui) -> Result<()> {
         }
         match event::read().context("reading terminal input")? {
             Event::Key(key) => app.handle_key(key),
-            Event::Mouse(mouse) => app.handle_mouse(mouse),
+            Event::Mouse(_) => {} // keyboard-only, including unsolicited terminal mouse reports
             Event::Resize(_, _) => {} // redrawn on the next iteration
             Event::FocusGained | Event::FocusLost => {}
             Event::Paste(text) => app.handle_paste(&text),

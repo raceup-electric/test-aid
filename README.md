@@ -114,7 +114,8 @@ or reverted. The marker does not mean that new remote commits are available;
 those use the yellow `[new: N]` badge.
 
 Select a commit with `Enter` to mark it as a pending pick. Press `s` to review
-the changes, then `Enter` or click **Apply** to save them. Closing the popup or
+the changes, write the required note, then `Enter` to finish it and `Enter` again
+to apply. Closing the popup or
 quitting without applying leaves the picks unapplied. Save handles each pick in
 turn and reports successes and failures; failed picks remain available to retry.
 
@@ -123,8 +124,22 @@ turn and reports successes and failures; failed picks remain available to retry.
   main repository. It does not commit that staged change.
 - For the **main repository**, Save checks out the selected commit with a
   detached HEAD. Local branches and newer commits remain intact.
-- Press `b` to switch the selected repository to a local branch. Switching a
+- Press `b` to switch the selected repository to a local or fetched remote branch.
+  Press `f` in the picker to fetch remote branches for all repositories without
+  changing any checkout. Remote rows have a `[remote]` label. Selecting one
+  creates and checks out a local branch with upstream tracking; existing local
+  branches are never overwritten (select the local row instead). Switching a
   submodule's branch alone does not stage a new pointer in the main repository.
+
+Note input opens automatically when saving commit picks, confirming a pull, or
+selecting a branch with `Enter`. Write 1–500 characters, including at least one
+non-whitespace character. `Enter` finishes typing; a second `Enter` confirms the
+action. `Esc` cancels and discards the draft. No separate `n` key is needed;
+`n` can still reopen a finished note for revision before confirming.
+One batch confirmation displays one note grouping all affected repositories,
+including their successful/failed/partial results. Separate confirmations remain
+separate notes, even with identical wording. Config-save and restore notes are
+collected in the same session.
 
 Checkout uses Git's safe mode: changes that would be overwritten cause an
 error. Uninitialized submodules are listed but cannot be edited; initialize
@@ -138,7 +153,7 @@ The Configurations view lists only initialized submodules with `.yaml`/`.yml` fi
 `coupled_controls/nmpc_spatial/config`. Git metadata, build/install/log folders,
 vendor/thirdparty trees, nested repositories, and symlinks are skipped.
 
-Choose a module, use `Tab` to focus its files, and press `Enter` (or click a file)
+Choose a module, use `Tab` to focus its files, and press `Enter`
 to open its parameter form. There is no free-text YAML editor. Existing YAML
 structure and scalar types define the form's schema: parameter names, nesting,
 types, and array lengths are fixed. Standalone validation schemas are not present
@@ -158,12 +173,11 @@ parameter value. Nulls, aliases, tagged/anchored and multiline values are
 read-only; merge keys and complex/duplicate mapping keys are refused.
 
 `Ctrl+S` validates pending input and opens a review popup listing each changed
-parameter's last-saved and proposed values. `Enter` or **Confirm save** writes
-the changes; `Esc` or **Back to edits** returns to the form without losing edits.
-Press `n` in the review popup to enter an optional note (up to 500 characters);
-`Enter`/`Esc` finishes the note, then `Enter` confirms saving. Use `↑`/`↓`,
-`PgUp`/`PgDn`, `Home`/`End` to scroll the preview. You can also click **Save**,
-**Back**, or **History** in the form.
+parameter's last-saved and proposed values, with the required note input already
+active (1–500 characters, including at least one non-whitespace character).
+`Enter` finishes the note; `Enter` again confirms saving. `Esc` returns to the
+form without losing edits. After finishing the note, use `↑`/`↓`, `PgUp`/`PgDn`,
+`Home`/`End` to scroll the preview; `n` reopens the note for revision.
 Saving does not stage or commit changes. Saves preserve comments,
 line endings, file permissions and all untouched formatting. UTF-8 files up to
 2 MiB are supported. Saving refuses to overwrite a file changed by another process.
@@ -174,7 +188,7 @@ switching; save with `Ctrl+S` or use `Ctrl+D` to discard and close.
 ### Global configuration history and recovery
 
 Every changed config save records full before/after file snapshots, parameter
-changes, UTC timestamp, module and stack-relative file path, branch/checkout commit, optional note, and
+changes, UTC timestamp, module and stack-relative file path, branch/checkout commit, required note, and
 the source of a restore. New saves also carry a unique **taid session ID**:
 one invocation groups every confirmed config save and repository action across
 modules and files. Branch switches, applied commit picks and confirmed pulls
@@ -185,8 +199,8 @@ No-op saves do not create entries. Records are retained without automatic prunin
 Edits made outside taid are not independently tracked; the next taid save records
 the on-disk version it started from.
 
-Press `h` from Repositories, Configurations, or a clean parameter form (or click
-**History**) to browse saved configuration and repository changes in the opened checkout, including
+Press `h` from Repositories, Configurations, or a clean parameter form to browse
+saved configuration and repository changes in the opened checkout, including
 its submodules. The top-level list shows sessions, their time spans, affected
 module/file/save counts, description and **active**, **closed**, or **interrupted**
 state. Separate concurrent taid instances have separate session IDs; an OS-held
@@ -201,8 +215,13 @@ Session → repository action / file → individual save navigation keeps interm
 - `↑`/`↓`, `PgUp`/`PgDn`, `Home`/`End` select entries.
 - `Enter` expands a session into repository actions and files, then a file into individual saves.
   `Backspace` returns to the parent level.
-- `n` edits the selected session's optional description (up to 500 characters);
-  `Enter` appends the description, `Esc` cancels. Save notes remain separate.
+- `n` appends an overall session note (up to 500 characters); `Enter` saves it,
+  `Esc` cancels. Existing notes are retained.
+- The selected session has a **Granular changes** pane on the left and a
+  **Session notes** pane on the right. All config, branch, commit, pull, restore,
+  and overall notes appear newest first with their action/file context, including
+  when inspecting a file or action within that session. Notes wrap over multiple
+  lines and scroll independently. On narrow terminals the panes stack vertically.
 - `/` searches module/file paths, session descriptions, save notes, branches and commit IDs; `Enter` keeps the
   search, `Esc` clears it, and `Ctrl+U` clears the search input.
 - `f` toggles between the selected file's history and all files.
@@ -211,17 +230,22 @@ Session → repository action / file → individual save navigation keeps interm
   session/file row. For `gain: 1 → 2 → 3`, the session diff is `1 → 3` while both
   saves remain accessible. Individual saves show **previous → saved**.
   Repository diffs show branch/checkout commit and staged submodule gitlinks
-  separately. Local branch tips and fetched remote refs are audit context only;
+  separately, with seven-character commit hashes and titles. Unavailable commit
+  objects show the short hash and a title-unavailable label; audit and restore
+  records retain full hashes. Local branch tips and fetched remote refs are audit context only;
   restoring never rewinds them. Action rows retain requests and results, even
   if the checkout did not change.
 - `c` switches to **current → selected**, previewing what a restore would change.
 - `b` chooses the selected entry's **before** or **after** snapshot as the restore
   target. The first entry's before snapshot is the baseline; the latest entry's
   before snapshot undoes the latest save.
-- `Tab` switches navigation between entries and the parameter-diff list.
+- `Tab`/`Shift+Tab` cycles between entries, changes, and notes.
+  The navigation keys scroll the focused pane.
 - `r` on a session/action/file row opens a review covering **all recorded targets in that row**;
-  `Enter` confirms the displayed writes, `Esc` cancels without writing, and `n`
-  adds an optional restore note. Search/filtering hides rows but does not secretly
+  Required note input opens immediately: `Enter` finishes typing, then `Enter`
+  confirms the displayed writes. `Esc` cancels without writing. One grouped note
+  documents every target in a batch.
+  Search/filtering hides rows but does not secretly
   narrow a session's restore scope; expand and select a file for a smaller restore.
 - `r` on an individual save loads pending form values; `Ctrl+S` reviews and
   confirms normally. Every changed restored file adds an individual save under
@@ -230,7 +254,7 @@ Session → repository action / file → individual save navigation keeps interm
   targets; `b` selects their **before** targets to review rollback. `w` shows
   observed per-file outcomes. Active/corrupt plans cannot be restored. Successfully
   confirmed recovery marks the old plan resolved without deleting its snapshots.
-- `h`/`Esc`/`q` closes History. Matching mouse buttons provide the same actions.
+- `h`/`Esc`/`q` closes History.
 
 Restoring changes only existing compatible parameter values, preserving the
 current file's comments, formatting and permissions. Missing/renamed keys, type
@@ -335,14 +359,23 @@ precedence over the new/ahead badge.
 Narrow list rows show the highest-priority state so module names remain readable;
 the summary explains additional states such as a detached checkout behind a branch.
 
-Press `Ctrl+P`, then `P` to open a confirmation popup. Press `Enter`/`y` or click
-**Pull** to fetch and fast-forward the main repository and every initialized
-submodule; `Esc`/`q`/`n` or **Cancel** closes it without any remote operation.
+Press `Ctrl+P`, then `P` to open a confirmation popup with note input active.
+Write a required note and press `Enter` to finish it, then `Enter`/`y` to fetch
+and fast-forward the main repository and every initialized submodule's current
+branch. `Esc` cancels without any remote operation. To discover branches without
+pulling the current checkout, use `b`, then `f`.
+To pull only one repository, highlight it and press `p` (in Configurations, this
+uses the highlighted module). The confirmation names that repository, and note
+input opens immediately. Only that repository is fetched and its current branch
+fast-forwarded; other repositories are untouched. `Ctrl+P`, `P` still
+pulls the whole stack. The same `p` action is available in the branch picker.
 Each target reports its own result, and failures do not
 stop the rest. Repositories without remotes are reported as skipped. Detached
 HEADs, missing upstreams, local file changes, and diverged branches are reported
 without overwriting files or creating merges. Apply or clear pending commit
-picks and close the config form before pulling. Wait for remote operations
+picks for the repositories being pulled and close the config form before pulling.
+Pending picks in other repositories remain available after a single-repository
+pull. Wait for remote operations
 to finish before quitting. Pulls temporarily block changes to commits/config
 files.
 Press `Ctrl+X` during a remote operation to cancel an active fetch and skip
@@ -362,18 +395,20 @@ outside taid. Press `n` to reopen the remote results and `↑`/`↓` to scroll t
 Normal browsing works offline; remote operations run only after you confirm
 the pull shortcut.
 
-## Keys and mouse
+## Keys
 
 | Key | Action |
 | --- | --- |
 | `Ctrl+R`, `R` | Repository management view (default) |
 | `Ctrl+C`, `C` | Module configurations view |
 | `Ctrl+P`, `P` | Confirm fetching and fast-forwarding all repositories |
+| `p` (repositories/configurations/branch picker) | Confirm pulling only the selected repository/module |
 | `↑` / `↓` or `k` / `j` | Move in the focused list |
 | `PgUp` / `PgDn`, `Home` / `End` | Move by page or to either end |
 | `Tab` / `Shift+Tab` / `←` / `→` | Switch panes |
 | `Enter` | Pick/unpick a commit, open a YAML form, edit/toggle a parameter, or confirm a popup |
-| `b` | Open the local branch switcher |
+| `b` | Open the local/remote branch switcher |
+| `f` (branch picker) | Fetch remote branches for all repositories without switching checkouts |
 | `/` | Filter commits by title or SHA (type to filter, `Enter` to keep, `Esc` to clear) |
 | `s` | Review and apply pending picks |
 | `r` | Refresh repository state |
@@ -384,7 +419,7 @@ the pull shortcut.
 | `/` (form) | Find parameters by name or comment |
 | `r` (form) | Reset the selected parameter to its last saved value |
 | `Ctrl+S` (form) | Validate and review parameter changes before saving |
-| `h` (repositories/configs/clean form) | Global sessions (repository actions + config saves); `Enter` expand, `Backspace` up, `/` search, `f` file/all, `n` description, `c` compare, `b` target, `r` review restore, `R` reload, `w` warnings, `u` recovery |
+| `h` (repositories/configs/clean form) | Global sessions (repository actions + config saves); `Enter` expand, `Backspace` up, `/` search, `f` file/all, `n` append note, `Tab` entries/changes/notes, `c` compare, `b` target, `r` review restore, `R` reload, `w` warnings, `u` recovery |
 | `Ctrl+X` | Cancel a fetch/skip remaining repositories; finish an active checkout |
 | `Esc` (form) | Cancel a value input/search or close a saved form |
 | `Ctrl+D` (form) | Discard unsaved parameter values and close |
@@ -393,9 +428,8 @@ Inside a value input, `←`/`→`, `Home`/`End` move the cursor,
 `Backspace`/`Delete` remove characters, and `Ctrl+U` clears it. Typing outside a
 value input cannot edit YAML. `Ctrl+C` starts the config shortcut instead of quitting.
 
-Click a repository or commit row to select and focus it. Click a branch row to
-switch to that branch, or use the popup buttons to apply, cancel, or acknowledge
-a result. The mouse wheel scrolls the focused list.
+The interface is keyboard-only. Mouse capture is disabled; clicks and wheel
+reports are ignored, including during confirmation dialogs.
 
 ## Scope
 

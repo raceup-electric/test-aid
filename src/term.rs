@@ -1,12 +1,10 @@
-//! Terminal lifecycle: alternate screen, raw mode, mouse capture, and a
+//! Terminal lifecycle: alternate screen, raw mode, keyboard input, and a
 //! panic hook that puts the terminal back before a panic message prints.
 
 use std::io::{self, Stdout};
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-};
+use crossterm::event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -45,7 +43,7 @@ pub fn init() -> Result<Tui> {
         execute!(
             stdout,
             EnterAlternateScreen,
-            EnableMouseCapture,
+            DisableMouseCapture,
             EnableBracketedPaste
         )
         .context("preparing the terminal")?;

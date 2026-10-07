@@ -146,10 +146,17 @@ impl Session {
     }
 }
 
+pub struct Note {
+    pub id: String,
+    pub text: String,
+}
+
 pub struct Info {
     pub started: i64,
     pub ended: Option<i64>,
     pub description: String,
+    /// All appended session notes, newest first.
+    pub notes: Vec<Note>,
     pub state: String,
 }
 
@@ -190,28 +197,57 @@ pub fn info(root: &Path, id: &str) -> Result<Info> {
         }
     }
     notes.sort();
-    let description = match notes.last() {
-        Some(file) => read::<String>(file)?,
-        None => String::new(),
-    };
+    let notes = notes
+        .iter()
+        .rev()
+        .map(|file| {
+            Ok(Note {
+                id: file
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .trim_start_matches("note-")
+                    .into(),
+                text: read::<String>(file)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let description = notes
+        .first()
+        .map(|note| note.text.clone())
+        .unwrap_or_default();
     Ok(Info {
         started: start.timestamp,
         ended,
         description,
+        notes,
         state: state.into(),
     })
 }
 
 pub fn describe(root: &Path, id: &str, description: &str) -> Result<()> {
     info(root, id)?; // Validate the scope and immutable start before appending.
-    if description.chars().count() > 500 || description.chars().any(char::is_control) {
-        bail!("session description must be at most 500 printable characters");
-    }
+    validate_note(description)?;
     let dir = directory(root, "config-sessions")?.join(id);
     write(
         &dir.join(format!("note-{}.json", identifier()?)),
         &description,
     )
+}
+
+pub(crate) fn validate_note(note: &str) -> Result<()> {
+    if note.chars().count() > 500 || note.chars().any(char::is_control) {
+        bail!("note must be at most 500 printable characters");
+    }
+    Ok(())
+}
+
+pub(crate) fn require_note(note: &str) -> Result<()> {
+    validate_note(note)?;
+    if note.trim().is_empty() {
+        bail!("A note is required: enter at least one non-whitespace character before confirming");
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -274,7 +310,7 @@ impl Review {
             errors: Vec::new(),
             warnings: Vec::new(),
             note: String::new(),
-            note_editing: false,
+            note_editing: true,
             scroll: 0,
             outcome: None,
             recovery,
@@ -383,6 +419,7 @@ impl Review {
     }
 
     pub fn confirm(&mut self, root: &Path, session: &str) -> Result<()> {
+        require_note(&self.note)?;
         if self.outcome.is_some() {
             bail!(
                 "restore already attempted; reopen history to retry after reviewing current disk values"
@@ -454,7 +491,15 @@ impl Review {
         let result = (|| -> Result<()> {
             for (index, repository) in self.repositories.iter().enumerate() {
                 if !repository.before.checkout_eq(&repository.after) {
-                    crate::repository_history::apply(root, session, repository, &self.note)?;
+                    crate::repository_history::apply(
+                        root,
+                        session,
+                        repository,
+                        &crate::repository_history::Annotation {
+                            note: &self.note,
+                            group: Some(&id),
+                        },
+                    )?;
                     repositories_applied += 1;
                 }
                 if !crate::repository_history::capture(root, &repository.before.module)?
@@ -728,7 +773,7 @@ mod tests {
         form.set_session(root, &session.id);
         form.activate();
         form.paste(value);
-        form.save()
+        form.save_with_note("Test config change")
     }
 
     fn populated(root: &Path, paths: &[PathBuf]) -> Result<Session> {
@@ -776,7 +821,7 @@ mod tests {
         );
         assert!(review.errors.is_empty(), "{:?}", review.errors);
         assert_eq!(fs::read_to_string(&paths[0])?, "gain: 2\n");
-        review.confirm(&root, &session.id)?;
+        crate::fixture::confirm_restore(&mut review, &root, &session.id)?;
         assert!(
             review
                 .outcome
@@ -834,7 +879,7 @@ mod tests {
             );
             assert!(review.errors.is_empty(), "{:?}", review.errors);
             BATCH_FAIL.with(|p| p.set(Some(0)));
-            review.confirm(&root, &session.id)?;
+            crate::fixture::confirm_restore(&mut review, &root, &session.id)?;
             assert!(review.outcome.as_ref().unwrap().contains("Restore stopped"));
             assert_eq!(repo.head()?.shorthand(), Some("main"));
             assert_eq!(fs::read_to_string(&paths[0])?, "# keep\ngain: 2\n");
@@ -857,7 +902,7 @@ mod tests {
                 browser.recovery_id(),
             );
             assert!(recovery.errors.is_empty(), "{:?}", recovery.errors);
-            recovery.confirm(&root, &session.id)?;
+            crate::fixture::confirm_restore(&mut recovery, &root, &session.id)?;
             assert!(recoveries(&root)?.0.is_empty());
             assert_eq!(
                 repo.head()?.shorthand(),
@@ -926,9 +971,66 @@ mod tests {
             "{:?}",
             review.errors
         );
-        assert!(review.confirm(&root, &session.id).is_err());
+        assert!(crate::fixture::confirm_restore(&mut review, &root, &session.id).is_err());
         assert_eq!(repo.head()?.target(), Some(old));
         assert_eq!(fs::read_to_string(&paths[0])?, "gain: 1\n");
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_repository_and_config_restore_has_one_shared_note_after_reopening() -> Result<()> {
+        let (_temp, root, paths) = fixture("session-mixed-shared-note")?;
+        let repo = git2::Repository::open(&root)?;
+        repo.branch("experiment", &repo.head()?.peel_to_commit()?, false)?;
+        let original = Session::begin(&root, SystemTime::now())?;
+        crate::repository_history::run_noted(
+            &root,
+            &original.id,
+            "branch switch",
+            ".",
+            "experiment",
+            "Test branch",
+            || {
+                crate::gitops::switch_branch(&repo, "experiment")?;
+                Ok("Selected experiment".into())
+            },
+        )?;
+        for path in &paths {
+            save(&root, path, &original, "2")?;
+        }
+        original.finish()?;
+        let browser = Browser::open(&root)?;
+        let mut review = Review::prepare_project(
+            &root,
+            browser.targets()?,
+            browser.repository_targets()?,
+            true,
+            "mixed restore".into(),
+            None,
+        );
+        assert!(review.note_editing, "note entry starts immediately");
+        assert!(review.errors.is_empty(), "{:?}", review.errors);
+        let restored = Session::begin(&root, SystemTime::now())?;
+        review.note = "Return to baseline".into();
+        review.confirm(&root, &restored.id)?;
+        assert!(
+            review
+                .outcome
+                .as_ref()
+                .unwrap()
+                .contains("Restored 2 file(s), 1 repository")
+        );
+        restored.finish()?;
+        let browser = Browser::open(&root)?;
+        assert_eq!(browser.notes().len(), 1);
+        assert_eq!(browser.notes()[0].1, "Return to baseline");
+        for subject in [". (completed)", "config/a.yaml", "subA/config/b.yaml"] {
+            assert!(
+                browser.notes()[0].0.contains(subject),
+                "{}",
+                browser.notes()[0].0
+            );
+        }
         Ok(())
     }
 
@@ -992,7 +1094,7 @@ mod tests {
         let mut old = Form::open_in(paths[0].clone(), &root)?;
         old.activate();
         old.paste("7");
-        old.save()?;
+        old.save_with_note("Test config change")?;
         let session = populated(&root, &paths)?;
         let mut browser = Browser::open(&root)?;
         assert_eq!(browser.visible.len(), 2);
@@ -1034,12 +1136,32 @@ mod tests {
         assert_eq!(review.files.len(), 2);
         assert_eq!(fs::read_to_string(&paths[0])?, "# keep\ngain: 3\n");
         let restore = Session::begin(&root, SystemTime::now())?;
-        review.confirm(&root, &restore.id)?;
+        for note in ["", " "] {
+            review.note = note.into();
+            assert!(review.confirm(&root, &restore.id).is_err());
+            assert_eq!(fs::read_to_string(&paths[0])?, "# keep\ngain: 3\n");
+            assert_eq!(fs::read_to_string(&paths[1])?, "# keep\ngain: 4\n");
+            assert_eq!(Store::list_global(&root, &[])?.0.len(), 3);
+            assert!(recoveries(&root)?.0.is_empty());
+        }
+        review.note = "x".into();
+        crate::fixture::confirm_restore(&mut review, &root, &restore.id)?;
         assert!(review.outcome.as_ref().unwrap().contains("Restored 2"));
         assert_eq!(fs::read_to_string(&paths[0])?, "# keep\ngain: 1\n");
         assert_eq!(fs::read_to_string(&paths[1])?, "# keep\ngain: 1\n");
         assert_eq!(Store::list_global(&root, &[])?.0.len(), 5);
         assert_eq!(Browser::open(&root)?.visible.len(), 2);
+        let browser = Browser::open(&root)?;
+        assert_eq!(
+            browser.notes().len(),
+            1,
+            "the two restored files share a single confirmation note"
+        );
+        assert_eq!(browser.notes()[0].1, "x");
+        assert!(
+            browser.notes()[0].0.contains("config/a.yaml")
+                && browser.notes()[0].0.contains("subA/config/b.yaml")
+        );
         assert!(recoveries(&root)?.0.is_empty());
         Ok(())
     }
@@ -1070,7 +1192,10 @@ mod tests {
             } else {
                 None
             };
-            assert!(review.confirm(&root, &original.id).is_err(), "{mode}");
+            assert!(
+                crate::fixture::confirm_restore(&mut review, &root, &original.id).is_err(),
+                "{mode}"
+            );
             assert_eq!(
                 fs::read_to_string(&paths[0])?,
                 "# keep\ngain: 3\n",
@@ -1102,7 +1227,7 @@ mod tests {
             fs::read_to_string(&paths[0])?,
             "# external comments preserved\ngain: 9\n"
         );
-        review.confirm(&root, &session.id)?;
+        crate::fixture::confirm_restore(&mut review, &root, &session.id)?;
         assert_eq!(
             fs::read_to_string(&paths[0])?,
             "# external comments preserved\ngain: 1\n"
@@ -1124,7 +1249,7 @@ mod tests {
                 None,
             );
             BATCH_FAIL.with(|p| p.set(Some(1)));
-            review.confirm(&root, &original.id)?;
+            crate::fixture::confirm_restore(&mut review, &root, &original.id)?;
             assert!(
                 review
                     .outcome
@@ -1154,7 +1279,7 @@ mod tests {
                 Some(recovery.id),
             );
             assert!(retry.errors.is_empty());
-            retry.confirm(&root, &original.id)?;
+            crate::fixture::confirm_restore(&mut retry, &root, &original.id)?;
             assert!(recoveries(&root)?.0.is_empty());
             assert_eq!(
                 fs::read_to_string(&paths[0])?,
@@ -1188,7 +1313,7 @@ mod tests {
             None,
         );
         BATCH_FAIL.with(|p| p.set(Some(0)));
-        review.confirm(&root, &session.id)?;
+        crate::fixture::confirm_restore(&mut review, &root, &session.id)?;
         let recovery = recoveries(&root)?.0.remove(0);
         let dir = directory(&root, "config-restores")?.join(&recovery.id);
         let live = lock(&dir.join("active.lock"), false)?;

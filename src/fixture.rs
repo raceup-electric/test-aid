@@ -14,6 +14,80 @@ pub const BASE_TIME: i64 = 1_700_000_000;
 
 static TEMP_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Document a test action using the same note input as a user, then press Enter.
+#[cfg(test)]
+pub(crate) fn confirm_action(app: &mut crate::app::App) {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let needs_note = if let Some(review) = &app.batch_review {
+        review.outcome.is_none() && review.note.trim().is_empty()
+    } else if let Some(form) = &app.form {
+        matches!(&form.overlay, Some(crate::config::Overlay::Save { note, .. }) if note.trim().is_empty())
+    } else {
+        app.action_note.trim().is_empty()
+            && (app
+                .branch_popup
+                .as_ref()
+                .is_some_and(|p| !p.branches.is_empty())
+                || matches!(&app.save_popup, Some(crate::app::SaveStage::Confirm(changes)) if !changes.is_empty())
+                || app.popup == Some(crate::app::Popup::PullConfirm))
+    };
+    if needs_note {
+        let editing = app.action_note_editing
+            || app.batch_review.as_ref().is_some_and(|r| r.note_editing)
+            || app.form.as_ref().is_some_and(|f| {
+                matches!(
+                    &f.overlay,
+                    Some(crate::config::Overlay::Save {
+                        note_editing: true,
+                        ..
+                    })
+                )
+            });
+        if !editing {
+            app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        }
+        app.handle_paste("Test change");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+#[cfg(test)]
+pub(crate) fn confirm_restore(
+    review: &mut crate::session::Review,
+    root: &Path,
+    session: &str,
+) -> Result<()> {
+    if review.note.is_empty() {
+        review.note = "Test restore".into();
+    }
+    review.confirm(root, session)
+}
+
+#[cfg(test)]
+pub(crate) fn confirm_form(
+    form: &mut crate::config::Form,
+    modifiers: crossterm::event::KeyModifiers,
+    page: usize,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    if matches!(&form.overlay, Some(crate::config::Overlay::Save { note, .. }) if note.trim().is_empty())
+    {
+        if matches!(
+            &form.overlay,
+            Some(crate::config::Overlay::Save {
+                note_editing: false,
+                ..
+            })
+        ) {
+            form.overlay_key(KeyCode::Char('n'), KeyModifiers::NONE, page);
+        }
+        form.paste("Test config change");
+        form.overlay_key(KeyCode::Enter, KeyModifiers::NONE, page);
+    }
+    form.overlay_key(KeyCode::Enter, modifiers, page)
+}
+
 /// A unique temporary directory, removed on drop.
 pub struct TempDir {
     path: PathBuf,

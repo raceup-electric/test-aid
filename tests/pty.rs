@@ -99,7 +99,7 @@ impl PtySession {
         })
     }
 
-    /// Wait until taid has emitted output (its first frame).
+    /// Wait for the complete first frame, rather than terminal setup bytes.
     ///
     /// Input must not be sent earlier: before taid enables raw mode, the
     /// pty is in canonical mode with ICRNL, which would translate our
@@ -107,12 +107,22 @@ impl PtySession {
     /// not Enter. Waiting for the first frame proves raw mode is on.
     fn wait_until_started(&mut self) -> Result<(), BoxError> {
         let deadline = Instant::now() + CHILD_TIMEOUT;
-        while self.early_output.is_empty() {
+        // hide_cursor is emitted once during init, then at the end of a frame.
+        // Both are needed: setup output alone does not prove the event loop is ready.
+        while self
+            .early_output
+            .windows(b"\x1b[?25l".len())
+            .filter(|w| *w == b"\x1b[?25l")
+            .count()
+            < 2
+        {
             match self.output.try_recv() {
                 Ok(chunk) => self.early_output.extend_from_slice(&chunk),
                 Err(mpsc::TryRecvError::Empty) => {
                     if Instant::now() >= deadline {
-                        return Err("taid produced no output before the deadline".into());
+                        return Err(
+                            "taid did not complete its first frame before the deadline".into()
+                        );
                     }
                     std::thread::sleep(POLL);
                 }
@@ -138,12 +148,41 @@ impl PtySession {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<(), BoxError> {
+        while let Ok(chunk) = self.output.try_recv() {
+            self.early_output.extend_from_slice(&chunk);
+        }
+        let start = self.early_output.len();
         self._master.resize(PtySize {
             rows,
             cols,
             pixel_width: 0,
             pixel_height: 0,
         })?;
+        let deadline = Instant::now() + CHILD_TIMEOUT;
+        loop {
+            let output = &self.early_output[start..];
+            // A resize clears the screen and then flushes a complete new frame.
+            if let Some(clear) = output.windows(4).position(|w| w == b"\x1b[2J") {
+                if output[clear + 4..].windows(6).any(|w| w == b"\x1b[?25l") {
+                    break;
+                }
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    format!(
+                        "taid did not redraw at {cols}x{rows}; output: {:?}",
+                        String::from_utf8_lossy(output)
+                    )
+                })?;
+            let chunk = self.output.recv_timeout(remaining).map_err(|error| {
+                format!(
+                    "taid did not redraw at {cols}x{rows}: {error}; output: {:?}",
+                    String::from_utf8_lossy(output)
+                )
+            })?;
+            self.early_output.extend_from_slice(&chunk);
+        }
         Ok(())
     }
 
@@ -214,7 +253,10 @@ fn startup_and_cancelled_pull_never_invoke_git() -> TestResult {
     let mut session = PtySession::spawn(&root, Some(("GIT_TRACE", trace.to_str().unwrap())))?;
     session.wait_until_started()?;
     std::thread::sleep(Duration::from_millis(250));
-    session.send("\u{10}pnq")?;
+    session.send("\u{10}p\u{1b}")?;
+    // ESC followed immediately by q is an Alt+q key in terminal protocols.
+    std::thread::sleep(Duration::from_millis(100));
+    session.send("q")?;
     let (status, raw) = session.finish();
     assert!(status.expect("cancel then q should exit").success());
     let screen = String::from_utf8_lossy(&raw);
@@ -228,6 +270,69 @@ fn startup_and_cancelled_pull_never_invoke_git() -> TestResult {
 }
 
 #[test]
+fn selected_submodule_pull_updates_only_that_checkout_and_records_its_note() -> TestResult {
+    let (temp, root) = super_repo("pty-selected-pull")?;
+    let parent = git2::Repository::open(&root)?;
+    let parent_head = parent.head()?.target();
+    // Pulling the whole stack would attempt this invalid remote and report failure.
+    parent.remote(
+        "origin",
+        temp.path().join("unselected-main").to_str().unwrap(),
+    )?;
+    let local = git2::Repository::open(root.join("subA"))?;
+    let old = local.head()?.target().unwrap();
+    let remote_path = temp.path().join("remote-subA");
+    let remote = git2::Repository::clone(root.join("subA").to_str().unwrap(), &remote_path)?;
+    local.remote("origin", remote_path.to_str().unwrap())?;
+    local.reference("refs/remotes/origin/main", old, false, "fixture upstream")?;
+    local
+        .find_branch("main", git2::BranchType::Local)?
+        .set_upstream(Some("origin/main"))?;
+    let new = taid::fixture::commit_file(
+        &remote,
+        "latest.txt",
+        "new trial\n",
+        "Latest steering trial",
+        taid::fixture::BASE_TIME + 10_000,
+    )?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    session.send("jpSteering update only\r\r")?;
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    while local.head()?.target() != Some(new) {
+        assert!(
+            Instant::now() < deadline,
+            "selected submodule was not pulled"
+        );
+        std::thread::sleep(POLL);
+    }
+    // Quit retries are harmless while the worker finishes its durable outcome.
+    while session.child.try_wait()?.is_none() {
+        assert!(Instant::now() < deadline, "pull worker did not finish");
+        session.send("\u{11}")?;
+        std::thread::sleep(POLL);
+    }
+    let (status, raw) = session.finish();
+    assert!(status.expect("selected pull exits").success(), "{raw:?}");
+    let screen = String::from_utf8_lossy(&raw);
+    assert!(screen.contains("Pull only subA?"), "{screen}");
+    assert!(!screen.contains("Pull the main repository"));
+    assert_eq!(parent.head()?.target(), parent_head);
+    assert_eq!(
+        taid::gitx::overview(&parent)?.submodules[0].index_oid,
+        Some(old)
+    );
+    let browser = taid::history::Browser::open(&root)?;
+    assert_eq!(browser.repository_events.len(), 1);
+    let event = &browser.repository_events[0];
+    assert_eq!(event.intent.subject, "subA");
+    assert_eq!(event.intent.note, "Steering update only");
+    assert!(event.outcome.as_ref().unwrap().success);
+    assert_eq!(browser.notes().len(), 1);
+    Ok(())
+}
+
+#[test]
 fn config_history_survives_restart_and_restore_requires_confirmation() -> TestResult {
     let (_temp, root) = super_repo("pty-config-history")?;
     let path = root.join("subA/config/params.yaml");
@@ -235,7 +340,7 @@ fn config_history_survives_restart_and_restore_requires_confirmation() -> TestRe
     std::fs::write(&path, "gain: 1\n")?;
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
-    session.send("\u{3}c\t\r\r2\r\u{13}nTuning\r\r\u{11}")?;
+    session.send("\u{3}c\t\r\r2\r\u{13}Tuning\r\r\u{11}")?;
     let (status, _) = session.finish();
     assert!(status.expect("first session exits").success());
     assert_eq!(std::fs::read_to_string(&path)?, "gain: 2\n");
@@ -247,7 +352,7 @@ fn config_history_survives_restart_and_restore_requires_confirmation() -> TestRe
     session.wait_until_started()?;
     // Global history opens directly from the default repository view, without
     // first locating the submodule or opening its config form.
-    session.send("h\r\rcbr\u{13}\r\u{11}")?;
+    session.send("h\r\rcbr\u{13}Restore baseline\r\r\u{11}")?;
     let (status, raw) = session.finish();
     assert!(status.expect("restored session exits").success());
     let screen = String::from_utf8_lossy(&raw);
@@ -273,7 +378,7 @@ fn session_groups_multiple_config_saves_and_restores_the_whole_session_after_res
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
     // Two saves to a.yaml, one to b.yaml, all in the same process/session.
-    session.send("\u{3}c\t\r\r2\r\u{13}\r\r3\r\u{13}\r\u{12}r\u{3}c\tj\r\r4\r\u{13}\r\u{12}rhnDry track tuning\r\u{11}")?;
+    session.send("\u{3}c\t\r\r2\r\u{13}First tuning\r\r\r3\r\u{13}Second tuning\r\r\u{12}r\u{3}c\tj\r\r4\r\u{13}Other config\r\r\u{12}rhnDry track tuning\r\u{11}")?;
     let (status, raw) = session.finish();
     assert!(
         status.expect("save session exits").success(),
@@ -292,7 +397,7 @@ fn session_groups_multiple_config_saves_and_restores_the_whole_session_after_res
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
     // Root session row: b chooses its baseline, r opens the ALL-file review.
-    session.send("hcbrnUndo dry tuning\r\r\r\u{11}")?;
+    session.send("hcbrUndo dry tuning\r\r\r\u{11}")?;
     let (status, raw) = session.finish();
     assert!(status.expect("restore session exits").success());
     let screen = String::from_utf8_lossy(&raw);
@@ -321,7 +426,7 @@ fn killing_taid_retains_immediate_saves_and_marks_the_session_interrupted() -> T
     std::fs::write(&path, "gain: 1\n")?;
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
-    session.send("\u{3}c\t\r\r2\r\u{13}\r")?;
+    session.send("\u{3}c\t\r\r2\r\u{13}Interrupted test\r\r")?;
     let deadline = Instant::now() + CHILD_TIMEOUT;
     while std::fs::read_to_string(&path)? != "gain: 2\n" {
         assert!(Instant::now() < deadline, "save never reached disk");
@@ -351,7 +456,7 @@ fn branch_only_history_survives_restart_and_reviews_restore_in_real_terminal() -
     repo.branch("feature", &repo.head()?.peel_to_commit()?, false)?;
     let mut first = PtySession::spawn(&root, None)?;
     first.wait_until_started()?;
-    first.send("b\rh\u{11}")?;
+    first.send("bnBranch trial\r\rh\u{11}")?;
     let (status, raw) = first.finish();
     assert!(status.expect("first session exits").success());
     assert!(
@@ -369,7 +474,7 @@ fn branch_only_history_survives_restart_and_reviews_restore_in_real_terminal() -
     let mut second = PtySession::spawn(&root, None)?;
     second.wait_until_started()?;
     // Expand the session, select before, review the action, explicitly confirm.
-    second.send("h\rbr\r\u{11}")?;
+    second.send("h\rbrRestore main\r\r\u{11}")?;
     let (status, _raw) = second.finish();
     assert!(status.expect("restoring session exits").success());
     assert_eq!(repo.head()?.shorthand(), Some("main"));
@@ -414,11 +519,14 @@ fn outside_a_repo_shows_popup_and_ok_exits() -> TestResult {
 }
 
 #[test]
-fn clicking_ok_exits_outside_a_repo() -> TestResult {
+fn mouse_ok_is_ignored_outside_a_repo() -> TestResult {
     let temp = TempDir::new("pty-notrepo-click")?;
     let mut session = PtySession::spawn(temp.path(), None)?;
     session.wait_until_started()?;
     session.click(40, 13)?;
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(session.child.try_wait()?.is_none(), "mouse cannot quit");
+    session.send("\r")?;
     let (status, raw) = session.finish();
 
     let status = status.expect("clicking OK should exit");
@@ -479,7 +587,7 @@ fn branch_switch_flow_end_to_end() -> TestResult {
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
     // b → popup, Enter → switch to `feature` (row 0), q → quit.
-    session.send("b\rq")?;
+    session.send("bnBranch test\r\rq")?;
     let (status, raw) = session.finish();
 
     let status = status.expect("taid should exit on its own after q");
@@ -497,7 +605,7 @@ fn branch_switch_flow_end_to_end() -> TestResult {
 }
 
 #[test]
-fn clicking_branch_row_switches_branch() -> TestResult {
+fn branch_rows_ignore_mouse_and_switch_with_keyboard() -> TestResult {
     let (_temp, root) = super_repo("pty-branch-click")?;
     let repo = taid::gitx::discover(&root)?.expect("repo");
     let head = repo.head()?.peel_to_commit()?;
@@ -508,8 +616,8 @@ fn clicking_branch_row_switches_branch() -> TestResult {
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
     session.send("b")?;
-    session.click(20, 11)?; // first branch row in the centered popup
-    session.send("q")?;
+    session.click(20, 11)?; // mouse is ignored
+    session.send("\rBranch keyboard test\r\rq")?;
     let (status, raw) = session.finish();
 
     let status = status.expect("taid should exit after branch click");
@@ -529,7 +637,7 @@ fn save_flow_end_to_end() -> TestResult {
     session.wait_until_started()?;
     // j → subA, Tab → commits, j → older commit, Enter → pick,
     // s → confirm, Enter → apply, q → close result, q → quit.
-    session.send("j\tj\rs\rqq")?;
+    session.send("j\tj\rsReplay commit\r\rqq")?;
     let (status, raw) = session.finish();
 
     let status = status.expect("taid should exit on its own");
@@ -575,7 +683,7 @@ fn save_flow_end_to_end() -> TestResult {
 }
 
 #[test]
-fn mouse_rows_and_apply_button_work_end_to_end() -> TestResult {
+fn mouse_rows_are_ignored_and_keyboard_save_works_end_to_end() -> TestResult {
     let (_temp, root) = super_repo("pty-mouse-save")?;
     let mut session = PtySession::spawn(&root, None)?;
     session.wait_until_started()?;
@@ -584,10 +692,10 @@ fn mouse_rows_and_apply_button_work_end_to_end() -> TestResult {
     // second history row on the right. Mouse clicks select/focus those rows.
     session.click(5, 4)?;
     session.click(40, 6)?;
-    session.send("\rs")?; // pick selected commit, open Save
+    session.send("j\tj\rs")?; // pick selected commit, open Save
     // The confirmation popup is 60×5 and centered; Apply is on its last row.
     session.click(33, 13)?;
-    session.send("qq")?; // close result, quit
+    session.send("Replay commit\r\rqq")?; // note, finish, confirm, close result, quit
     let (status, raw) = session.finish();
 
     let status = status.expect("taid should exit after clicking Apply");
@@ -608,12 +716,142 @@ fn resize_redraws_and_quits_cleanly() -> TestResult {
     session.wait_until_started()?;
     session.resize(40, 12)?;
     session.resize(100, 30)?;
+    // Also keep the original rapid-resize/quit case: queued resize events
+    // must not swallow the following key, even when no redraw separates them.
+    for (cols, rows) in [(60, 16), (120, 36)] {
+        session._master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+    }
     session.send("q")?;
     let (status, raw) = session.finish();
 
     let status = status.expect("taid should exit after resizing");
     assert!(status.success(), "raw output: {raw:?}");
     assert!(String::from_utf8_lossy(&raw).contains("subA"));
+    Ok(())
+}
+
+#[test]
+fn session_notes_collect_config_branch_and_commit_changes_after_restart() -> TestResult {
+    let (_temp, root) = super_repo("pty-session-notes")?;
+    let path = root.join("subA/config/params.yaml");
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, "gain: 1\n")?;
+    let repo = git2::Repository::open(&root)?;
+    repo.branch("feature", &repo.head()?.peel_to_commit()?, false)?;
+    let mut first = PtySession::spawn(&root, None)?;
+    first.wait_until_started()?;
+    first.send("\u{3}c\t\r\r2\r\u{13}Tune steering\r\r\u{1b}\u{12}rbnUse test branch\r\rj\tj\rsReplay sensor data\r\rq\u{11}")?;
+    let (status, raw) = first.finish();
+    assert!(status.expect("noted session exits").success(), "{raw:?}");
+    assert_eq!(std::fs::read_to_string(&path)?, "gain: 2\n");
+    assert_eq!(repo.head()?.shorthand(), Some("feature"));
+    let mut browser = taid::history::Browser::open(&root)?;
+    let notes = browser.notes();
+    assert_eq!(
+        notes
+            .iter()
+            .map(|(_, note)| note.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Replay sensor data", "Use test branch", "Tune steering"]
+    );
+    browser.key(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+        10,
+    );
+    assert_eq!(
+        browser.notes(),
+        notes,
+        "drilling down retains the entire session's notes"
+    );
+
+    let mut second = PtySession::spawn(&root, None)?;
+    second.wait_until_started()?;
+    second.resize(140, 40)?;
+    second.send("h")?;
+    // Append two overall notes; older notes stay visible and searchable.
+    second.send("nFirst session note\rnSecond session note\r\u{11}")?;
+    let (status, raw) = second.finish();
+    assert!(status.expect("history session exits").success());
+    let screen = String::from_utf8_lossy(&raw);
+    for text in ["Granular changes", "Session notes"] {
+        assert!(screen.contains(text), "{text}: {screen}");
+    }
+    let mut browser = taid::history::Browser::open(&root)?;
+    let notes = browser.notes();
+    assert_eq!(notes[0].1, "Second session note");
+    assert_eq!(notes[1].1, "First session note");
+    assert_eq!(notes.len(), 5);
+    browser.key(
+        crossterm::event::KeyCode::Char('/'),
+        crossterm::event::KeyModifiers::NONE,
+        10,
+    );
+    browser.paste("First session note");
+    assert_eq!(
+        browser.visible.len(),
+        1,
+        "older overall notes remain searchable"
+    );
+    Ok(())
+}
+
+#[test]
+fn one_note_documents_three_repositories_saved_together_after_restart() -> TestResult {
+    let temp = TempDir::new("pty-three-repository-note")?;
+    let root = temp.path().join("super");
+    let stack = taid::fixture::make_super(
+        &root,
+        &[
+            SubSpec {
+                name: "subA",
+                msgs: &["a1", "a2"],
+                recorded: None,
+                drop_workdir: false,
+            },
+            SubSpec {
+                name: "subB",
+                msgs: &["b1", "b2"],
+                recorded: None,
+                drop_workdir: false,
+            },
+            SubSpec {
+                name: "subC",
+                msgs: &["c1", "c2"],
+                recorded: None,
+                drop_workdir: false,
+            },
+        ],
+    )?;
+    let mut session = PtySession::spawn(&root, None)?;
+    session.wait_until_started()?;
+    // Select an older commit in each submodule, then save once. No n key.
+    session.send("j\tj\r\tj\tj\r\tj\tj\rsReplay wet track\r\rqq")?;
+    let (status, raw) = session.finish();
+    assert!(status.expect("batch save should exit").success(), "{raw:?}");
+    let browser = taid::history::Browser::open(&root)?;
+    assert_eq!(browser.repository_events.len(), 3);
+    assert_eq!(browser.notes().len(), 1);
+    assert_eq!(browser.notes()[0].1, "Replay wet track");
+    for name in ["subA", "subB", "subC"] {
+        assert!(browser.notes()[0].0.contains(name));
+        assert_eq!(
+            git2::Repository::open(root.join(name))?.head()?.target(),
+            Some(stack.sub_oids[name][0])
+        );
+    }
+    let screen = String::from_utf8_lossy(&raw);
+    for enable_mouse in ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h", "\x1b[?1006h"] {
+        assert!(
+            !screen.contains(enable_mouse),
+            "mouse capture must never be enabled"
+        );
+    }
     Ok(())
 }
 
@@ -627,7 +865,7 @@ fn config_chord_edits_and_saves_a_real_file() -> TestResult {
     session.wait_until_started()?;
     // Ctrl+C, C → configs; Tab/Enter → form; Enter/2/Enter → typed value;
     // Ctrl+S/Enter → review/confirm; Esc → files; Ctrl+R, R → repositories; q → exit.
-    session.send("\u{3}c\t\r\r2\r\u{13}\r\u{1b}\u{12}rq")?;
+    session.send("\u{3}c\t\r\r2\r\u{13}Config test\r\r\u{1b}\u{12}rq")?;
     let (status, raw) = session.finish();
     assert!(
         status.expect("config workflow should exit").success(),

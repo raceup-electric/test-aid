@@ -10,9 +10,7 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent};
 use git2::Repository;
 use ratatui::layout::Rect;
 
@@ -37,8 +35,6 @@ pub struct ConfigModule {
 const INITIAL_WINDOW: usize = 60;
 /// Extra rows materialized ahead of the viewport while scrolling.
 const AHEAD_MARGIN: usize = 40;
-/// Rows scrolled per wheel notch in the commit list.
-const WHEEL_STEP: i32 = 3;
 
 /// What taid is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,7 +73,7 @@ pub enum Popup {
 }
 
 /// State of the branch-switcher popup (`b`): the entry it acts on, that
-/// entry's local branches, and a notice line (info or switch error).
+/// entry's local/remote branches, and a notice line (info or switch error).
 pub struct BranchPopup {
     /// Index into the repos list (0 = main repository).
     pub entry_idx: usize,
@@ -117,7 +113,7 @@ pub enum SaveStage {
     Result(ApplyOutcome),
 }
 
-/// A clickable region, registered by the renderer each frame.
+/// A control region, registered by the renderer for layout verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hit {
     PaneRepos,
@@ -139,6 +135,8 @@ pub enum Hit {
     ConfigConfirm,
     ConfigCancel,
     HistoryRow(usize),
+    HistoryChanges,
+    HistoryNotes,
     HistoryCompare,
     HistoryVersion,
     HistoryRestore,
@@ -319,6 +317,10 @@ pub struct App {
     pub form: Option<config::Form>,
     pub global_history: Option<crate::history::Browser>,
     pub batch_review: Option<crate::session::Review>,
+    pub action_note: String,
+    pub action_note_editing: bool,
+    /// Frozen target for the pull confirmation; None means the whole stack.
+    pub pull_target: Option<network::Target>,
     session: Option<crate::session::Session>,
     session_started: std::time::SystemTime,
     pub status: String,
@@ -346,7 +348,7 @@ pub struct App {
     pub popup: Option<Popup>,
     pub branch_popup: Option<BranchPopup>,
     pub save_popup: Option<SaveStage>,
-    /// Clickable regions, refreshed by the renderer every frame.
+    /// Control regions, refreshed by the renderer for layout verification.
     pub hit_zones: Vec<(Rect, Hit)>,
     pub pane_heights: PaneHeights,
     pub should_quit: bool,
@@ -378,6 +380,9 @@ impl App {
             form: None,
             global_history: None,
             batch_review: None,
+            action_note: String::new(),
+            action_note_editing: false,
+            pull_target: None,
             session: None,
             session_started: std::time::SystemTime::now(),
             status: String::new(),
@@ -421,6 +426,9 @@ impl App {
             form: None,
             global_history: None,
             batch_review: None,
+            action_note: String::new(),
+            action_note_editing: false,
+            pull_target: None,
             session: None,
             session_started: std::time::SystemTime::now(),
             status: String::new(),
@@ -514,6 +522,38 @@ impl App {
             self.handle_batch_key(key);
             return;
         }
+        if self.branch_popup.is_none()
+            && self.save_popup.is_none()
+            && self.popup != Some(Popup::PullConfirm)
+        {
+            self.action_note_editing = false;
+        }
+        if self.action_note_editing {
+            match key.code {
+                KeyCode::Enter => self.action_note_editing = !self.require_action_note(),
+                KeyCode::Esc => {
+                    self.action_note_editing = false;
+                    self.branch_popup = None;
+                    self.save_popup = None;
+                    self.popup = None;
+                }
+                KeyCode::Backspace => {
+                    self.action_note.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.action_note.clear()
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.append_action_note(&c.to_string())
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.mode == Mode::Normal && self.handle_shortcut(key) {
             return;
         }
@@ -531,14 +571,11 @@ impl App {
             Mode::Normal if self.branch_popup.is_some() => self.handle_branch_key(key.code),
             Mode::Normal if self.filter_editing => self.handle_filter_key(key.code, key.modifiers),
             Mode::Normal if self.popup == Some(Popup::PullConfirm) => match key.code {
+                KeyCode::Char('n') | KeyCode::Char('N') => self.action_note_editing = true,
                 KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.start_network(network::Operation::Pull);
+                    self.start_network_target(network::Operation::Pull, self.pull_target.clone());
                 }
-                KeyCode::Esc
-                | KeyCode::Char('q')
-                | KeyCode::Char('Q')
-                | KeyCode::Char('n')
-                | KeyCode::Char('N') => self.popup = None,
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.popup = None,
                 _ => {}
             },
             Mode::Normal if self.popup.is_some() => match key.code {
@@ -693,6 +730,7 @@ impl App {
 
     fn handle_config_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('p') => self.request_selected_pull(),
             KeyCode::Char('h') | KeyCode::Char('H') => self.open_global_history(),
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Char('?') => {
@@ -866,7 +904,10 @@ impl App {
         let review = self.batch_review.as_mut().unwrap();
         if review.note_editing {
             match key.code {
-                KeyCode::Enter | KeyCode::Esc => review.note_editing = false,
+                KeyCode::Enter => {
+                    review.note_editing = crate::session::require_note(&review.note).is_err()
+                }
+                KeyCode::Esc => self.close_batch_review(),
                 KeyCode::Backspace => {
                     review.note.pop();
                 }
@@ -891,6 +932,10 @@ impl App {
             KeyCode::Enter if review.outcome.is_some() => self.close_batch_review(),
             KeyCode::Char('n') if review.outcome.is_none() => review.note_editing = true,
             KeyCode::Enter => {
+                if crate::session::require_note(&review.note).is_err() {
+                    review.note_editing = true;
+                    return;
+                }
                 let result = (|| -> Result<()> {
                     if self.is_pulling() {
                         anyhow::bail!("remote operation in progress; nothing was written");
@@ -1027,6 +1072,10 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.action_note_editing {
+            self.append_action_note(text);
+            return;
+        }
         if let Some(review) = &mut self.batch_review {
             if review.note_editing {
                 review.note.extend(
@@ -1047,59 +1096,171 @@ impl App {
     }
 
     fn request_pull(&mut self) {
-        if !self.can_start_network(network::Operation::Pull) {
+        self.request_pull_target(None);
+    }
+
+    fn request_selected_pull(&mut self) {
+        let idx = if let Some(branch) = &self.branch_popup {
+            branch.entry_idx
+        } else if self.view == View::Configurations {
+            let Some(module) = self.config_modules.get(self.config_repos.selected()) else {
+                return;
+            };
+            module.entry_idx
+        } else {
+            self.repos.selected()
+        };
+        let Some(ov) = &self.overview else {
+            return;
+        };
+        let target = if idx == 0 {
+            network::Target {
+                name: self.entry_name(0),
+                path: Some(ov.root.clone()),
+            }
+        } else {
+            let Some(module) = ov.submodules.get(idx - 1) else {
+                return;
+            };
+            network::Target {
+                name: module.path.clone(),
+                path: module.workdir.clone(),
+            }
+        };
+        if target.path.is_none() {
+            self.status = format!(
+                "{} is not initialized; initialize this submodule before pulling",
+                target.name
+            );
             return;
         }
+        self.request_pull_target(Some(target));
+    }
+
+    fn request_pull_target(&mut self, target: Option<network::Target>) {
+        if !self.can_start_network(network::Operation::Pull, target.as_ref()) {
+            return;
+        }
+        self.pull_target = target;
         self.branch_popup = None;
         self.save_popup = None;
         self.filter_editing = false;
         self.global_history = None;
+        self.action_note.clear();
+        self.action_note_editing = true;
         self.popup = Some(Popup::PullConfirm);
     }
 
-    fn can_start_network(&mut self, operation: network::Operation) -> bool {
+    fn append_action_note(&mut self, text: &str) {
+        self.action_note.extend(
+            text.chars()
+                .filter(|c| !c.is_control())
+                .take(500usize.saturating_sub(self.action_note.chars().count())),
+        );
+    }
+
+    fn require_action_note(&mut self) -> bool {
+        if let Err(error) = crate::session::require_note(&self.action_note) {
+            self.action_note_editing = true;
+            self.status = error.to_string();
+            if let Some(branch) = &mut self.branch_popup {
+                branch.notice = Some(error.to_string());
+            }
+            false
+        } else {
+            if self.status.starts_with("A note is required:") {
+                self.status.clear();
+            }
+            true
+        }
+    }
+
+    fn can_start_network(
+        &mut self,
+        operation: network::Operation,
+        target: Option<&network::Target>,
+    ) -> bool {
         if self.mode != Mode::Normal {
             return false;
         }
         if self.network_job.is_some() {
-            self.status =
-                "Remote operation already running; retry Ctrl+P,P after it finishes".into();
+            self.status = "Remote operation already running; retry after it finishes".into();
             return false;
         }
         if let Some(form) = self.form.as_mut() {
             form.notice = "Close the config form before pulling".into();
             return false;
         }
-        if operation == network::Operation::Pull && self.entries.iter().any(|e| e.pick.is_some()) {
-            self.status =
-                "Apply or clear pending commit picks before pulling all repositories".into();
+        let pending = self.entries.iter().any(|entry| {
+            entry.pick.is_some()
+                && target.is_none_or(|target| match &entry.key {
+                    EntryKey::Main => self
+                        .overview
+                        .as_ref()
+                        .is_some_and(|ov| target.path.as_ref() == Some(&ov.root)),
+                    EntryKey::Sub(path) => target.name == *path,
+                })
+        });
+        if operation == network::Operation::Pull && pending {
+            self.status = if target.is_some() {
+                "Apply or clear pending commit picks for the selected repository before pulling it"
+            } else {
+                "Apply or clear pending commit picks before pulling all repositories"
+            }
+            .into();
             return false;
         }
         self.overview.is_some()
     }
 
     pub fn start_network(&mut self, operation: network::Operation) {
-        if !self.can_start_network(operation) {
+        self.start_network_target(operation, None);
+    }
+
+    fn start_network_target(
+        &mut self,
+        operation: network::Operation,
+        target: Option<network::Target>,
+    ) {
+        if !self.can_start_network(operation, target.as_ref()) {
             return;
         }
+        if operation == network::Operation::Pull && !self.require_action_note() {
+            return;
+        }
+        self.action_note_editing = false;
         let Some(ov) = &self.overview else {
             return;
         };
         // Snapshot all targets before the superproject's pull can change .gitmodules.
-        let mut targets = vec![network::Target {
-            name: self.entry_name(0),
-            path: Some(ov.root.clone()),
-        }];
-        for sm in &ov.submodules {
-            targets.push(network::Target {
-                name: sm.path.clone(),
-                path: sm.workdir.clone(),
-            });
-        }
+        let selected_name = target.as_ref().map(|target| target.name.clone());
+        let targets = if let Some(target) = target {
+            vec![target]
+        } else {
+            let mut targets = vec![network::Target {
+                name: self.entry_name(0),
+                path: Some(ov.root.clone()),
+            }];
+            for sm in &ov.submodules {
+                targets.push(network::Target {
+                    name: sm.path.clone(),
+                    path: sm.workdir.clone(),
+                });
+            }
+            targets
+        };
         let root = ov.root.clone();
         let recording = if operation == network::Operation::Pull {
-            match self.ensure_session() {
-                Ok(session) => Some(network::Recording { root, session }),
+            match self
+                .ensure_session()
+                .and_then(|session| Ok((session, crate::session::identifier()?)))
+            {
+                Ok((session, note_group)) => Some(network::Recording {
+                    root,
+                    session,
+                    note: self.action_note.clone(),
+                    note_group,
+                }),
                 Err(e) => {
                     self.status = format!("Pull not started: history unavailable: {e:#}");
                     return;
@@ -1109,11 +1270,12 @@ impl App {
             None
         };
         self.status = if operation == network::Operation::Pull {
-            "Pulling all repositories…"
+            selected_name
+                .map(|name| format!("Pulling only {name}…"))
+                .unwrap_or_else(|| "Pulling all repositories…".into())
         } else {
-            "Checking remote updates…"
-        }
-        .into();
+            "Checking remote updates…".into()
+        };
         self.network_operation = Some(operation);
         if operation == network::Operation::Pull {
             self.branch_popup = None;
@@ -1161,6 +1323,30 @@ impl App {
                 if self.view == View::Configurations {
                     self.discover_configs();
                 }
+                if !pulling {
+                    if let Some(idx) = self.branch_popup.as_ref().map(|p| p.entry_idx) {
+                        self.ensure_sub_repo(idx);
+                        let repo = if idx == 0 {
+                            self.repo.as_ref()
+                        } else {
+                            self.sub_repos[idx - 1].as_ref()
+                        };
+                        if let (Some(repo), Some(popup)) = (repo, self.branch_popup.as_mut()) {
+                            match gitops::branches(repo) {
+                                Ok(branches) => {
+                                    popup.scroll = ScrollState::new(branches.len());
+                                    popup.branches = branches;
+                                    popup.notice = Some(format!(
+                                        "Remote branches refreshed · {failed} fetch failures · Esc close, then n results"
+                                    ));
+                                }
+                                Err(e) => {
+                                    popup.notice = Some(format!("Cannot reload branches: {e:#}"))
+                                }
+                            }
+                        }
+                    }
+                }
                 if pulling {
                     self.report_scroll = 0;
                     self.popup = Some(Popup::Network);
@@ -1200,6 +1386,7 @@ impl App {
 
     fn handle_normal_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('p') => self.request_selected_pull(),
             KeyCode::Char('h') | KeyCode::Char('H') => self.open_global_history(),
             KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => self.request_quit(),
             KeyCode::Char('n') => {
@@ -1300,255 +1487,14 @@ impl App {
         entry.filtered_for = filter.clone();
     }
 
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) => self.handle_click(mouse.column, mouse.row),
-            MouseEventKind::ScrollUp => self.wheel(-1),
-            MouseEventKind::ScrollDown => self.wheel(1),
-            _ => {}
-        }
-    }
-
-    fn wheel(&mut self, dir: i32) {
-        if self.batch_review.is_some() {
-            self.handle_batch_key(KeyEvent::new(
-                if dir < 0 { KeyCode::Up } else { KeyCode::Down },
-                KeyModifiers::NONE,
-            ));
-            return;
-        }
-        if self.global_history.is_some() {
-            self.handle_global_history_key(KeyEvent::new(
-                if dir < 0 { KeyCode::Up } else { KeyCode::Down },
-                KeyModifiers::NONE,
-            ));
-            return;
-        }
-        if self.mode != Mode::Normal || self.popup.is_some() || self.save_popup.is_some() {
-            return;
-        }
-        if self.branch_popup.is_some() {
-            self.branch_scroll(dir * WHEEL_STEP);
-            return;
-        }
-        if let Some(form) = &mut self.form {
-            if form.overlay.is_some() {
-                form.overlay_key(
-                    if dir < 0 { KeyCode::Up } else { KeyCode::Down },
-                    KeyModifiers::NONE,
-                    self.pane_heights.commits,
-                );
-            } else if form.editing.is_none() && !form.filtering {
-                form.key(
-                    if dir < 0 { KeyCode::Up } else { KeyCode::Down },
-                    KeyModifiers::NONE,
-                    self.pane_heights.commits,
-                );
-            }
-            return;
-        }
-        if self.view == View::Configurations {
-            self.handle_config_key(if dir < 0 { KeyCode::Up } else { KeyCode::Down });
-            return;
-        }
-        match self.focus {
-            Focus::Repos => {
-                self.repos.move_by(dir);
-                self.ensure_entry_loaded(self.repos.selected());
-                self.ensure_repos_visible();
-            }
-            Focus::Commits => {
-                self.commit_scroll(|s| {
-                    for _ in 0..WHEEL_STEP {
-                        s.move_by(dir);
-                    }
-                });
-            }
-        }
-    }
-
-    fn handle_click(&mut self, col: u16, row: u16) {
-        let hit = self.hit_test(col, row);
-        if self.batch_review.is_some() {
-            match hit {
-                Some(Hit::ConfigConfirm) => {
-                    self.batch_review.as_mut().unwrap().note_editing = false;
-                    self.handle_batch_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-                }
-                Some(Hit::ConfigCancel) => self.close_batch_review(),
-                _ => {}
-            }
-            return;
-        }
-        if let Some(browser) = &mut self.global_history {
-            let code = match hit {
-                Some(Hit::HistoryRow(idx)) => {
-                    browser.select(idx);
-                    None
-                }
-                Some(Hit::HistoryCompare) => Some(KeyCode::Char('c')),
-                Some(Hit::HistoryVersion) => Some(KeyCode::Char('b')),
-                Some(Hit::HistoryRestore) => Some(KeyCode::Char('r')),
-                Some(Hit::ConfigCancel) => {
-                    self.global_history = None;
-                    None
-                }
-                _ => None,
-            };
-            if let Some(code) = code {
-                self.handle_global_history_key(KeyEvent::new(code, KeyModifiers::NONE));
-            }
-            return;
-        }
-        if let Some(form) = self.form.as_mut().filter(|f| f.overlay.is_some()) {
-            if hit == Some(Hit::ConfigCancel) {
-                form.overlay = None;
-                return;
-            }
-            if hit == Some(Hit::ConfigConfirm) {
-                if let Some(config::Overlay::Save { note_editing, .. }) = &mut form.overlay {
-                    *note_editing = false;
-                }
-            }
-            let code = match hit {
-                Some(Hit::ConfigConfirm) => Some(KeyCode::Enter),
-                Some(Hit::ConfigCancel) => Some(KeyCode::Esc),
-                Some(Hit::HistoryCompare) => Some(KeyCode::Char('c')),
-                Some(Hit::HistoryVersion) => Some(KeyCode::Char('b')),
-                Some(Hit::HistoryRestore) => Some(KeyCode::Char('r')),
-                Some(Hit::HistoryRow(idx)) => {
-                    if let Err(e) = form.select_history(idx) {
-                        form.notice = format!("{e:#}");
-                    }
-                    None
-                }
-                _ => None,
-            };
-            if let Some(code) = code {
-                self.handle_form_key(KeyEvent::new(code, KeyModifiers::NONE));
-            }
-            return;
-        }
-        if self.popup == Some(Popup::PullConfirm) {
-            match hit {
-                Some(Hit::PullConfirm) => self.start_network(network::Operation::Pull),
-                Some(Hit::PullCancel) => self.popup = None,
-                _ => {}
-            }
-            return;
-        }
-        if self.form.is_some() {
-            if hit == Some(Hit::ParameterHistory) {
-                self.handle_form_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-                return;
-            }
-            if hit == Some(Hit::ParameterSave) {
-                self.handle_form_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-                return;
-            }
-            if hit == Some(Hit::ParameterBack) {
-                self.handle_form_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-                return;
-            }
-        }
-        if let Some(form) = &mut self.form {
-            if let Some(Hit::ParameterRow(i)) = hit {
-                if form.editing.is_some() {
-                    return;
-                }
-                form.scroll.select(i);
-                form.activate();
-            }
-            return;
-        }
-        // Save popup: buttons act, clicks inside the body are ignored,
-        // clicks outside close it (Cancel never applies anything).
-        if self.mode == Mode::Normal && self.save_popup.is_some() {
-            match self.hit_test(col, row) {
-                Some(Hit::SaveApply) => {
-                    if matches!(self.save_popup, Some(SaveStage::Confirm(_))) {
-                        self.apply_saves();
-                    } else {
-                        self.save_popup = None;
-                    }
-                }
-                Some(Hit::SaveCancel) | Some(Hit::SaveOk) => self.save_popup = None,
-                Some(Hit::SavePopup) => {}
-                _ => self.save_popup = None,
-            }
-            return;
-        }
-        // Branch popup: clicking a row selects and switches; anything else
-        // just closes it.
-        if self.mode == Mode::Normal && self.branch_popup.is_some() {
-            match self.hit_test(col, row) {
-                Some(Hit::BranchRow(i)) => {
-                    if let Some(bp) = self.branch_popup.as_mut() {
-                        bp.scroll.select(i);
-                    }
-                    self.switch_selected_branch();
-                }
-                _ => self.branch_popup = None,
-            }
-            return;
-        }
-        // While a popup is open, any click dismisses it and goes no further.
-        if self.mode == Mode::Normal && self.popup.is_some() {
-            self.popup = None;
-            return;
-        }
-        match self.hit_test(col, row) {
-            Some(Hit::ConfigModule(i)) => {
-                self.focus = Focus::Repos;
-                self.select_config_module(i);
-            }
-            Some(Hit::ConfigFile(i)) => {
-                self.focus = Focus::Commits;
-                self.config_files.select(i);
-                self.open_config();
-            }
-            Some(Hit::RepoRow(i)) => {
-                self.focus = Focus::Repos;
-                self.repos.select(i);
-                self.ensure_entry_loaded(i);
-                self.ensure_repos_visible();
-            }
-            Some(Hit::CommitRow(r)) => {
-                self.focus = Focus::Commits;
-                let idx = self.repos.selected();
-                self.ensure_entry_loaded(idx);
-                if let Some(entry) = self.entries.get_mut(idx) {
-                    entry.scroll.select(r);
-                }
-                self.ensure_commits_ahead();
-            }
-            Some(Hit::PaneRepos) if self.has_submodules() => self.focus = Focus::Repos,
-            Some(Hit::PaneCommits) => self.focus = Focus::Commits,
-            Some(Hit::OkButton) => self.should_quit = true,
-            _ => {}
-        }
-    }
+    /// Mouse input is deliberately ignored: taid is keyboard-only.
+    pub fn handle_mouse(&mut self, _mouse: MouseEvent) {}
 
     /// Select entry `idx` in the repos pane and make sure its history is
-    /// loaded (the public selection entry point used by keys, clicks and tests).
+    /// loaded (the public selection entry point used by keys and tests).
     pub fn select_repo(&mut self, idx: usize) {
         self.repos.select(idx);
         self.ensure_entry_loaded(self.repos.selected());
-    }
-
-    /// Most specific hit wins: the smallest registered region containing
-    /// the click (a row inside a pane, not the pane).
-    fn hit_test(&self, col: u16, row: u16) -> Option<Hit> {
-        self.hit_zones
-            .iter()
-            .filter(|(rect, _)| {
-                col >= rect.x
-                    && col < rect.x + rect.width
-                    && row >= rect.y
-                    && row < rect.y + rect.height
-            })
-            .min_by_key(|(rect, _)| rect.width * rect.height)
-            .map(|(_, hit)| *hit)
     }
 
     // ---- branch switcher -------------------------------------------------
@@ -1558,6 +1504,9 @@ impl App {
 
     fn handle_branch_key(&mut self, code: KeyCode) {
         match code {
+            KeyCode::Char('p') => self.request_selected_pull(),
+            KeyCode::Char('f') => self.start_network(network::Operation::Check),
+            KeyCode::Char('n') => self.action_note_editing = true,
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.branch_popup = None,
             KeyCode::Up | KeyCode::Char('k') => self.branch_scroll(-1),
             KeyCode::Down | KeyCode::Char('j') => self.branch_scroll(1),
@@ -1621,6 +1570,8 @@ impl App {
             notice.or_else(|| (branches.is_empty()).then(|| "no branches yet".to_string()));
 
         let len = branches.len();
+        self.action_note.clear();
+        self.action_note_editing = false;
         self.branch_popup = Some(BranchPopup {
             entry_idx: idx,
             branches,
@@ -1633,16 +1584,24 @@ impl App {
     /// everything. A refused switch (dirty tree) keeps the popup open with
     /// the error as its notice.
     fn switch_selected_branch(&mut self) {
-        if self.is_pulling() {
+        self.action_note_editing = false;
+        if self.network_job.is_some() {
+            if let Some(popup) = &mut self.branch_popup {
+                popup.notice =
+                    Some("Wait for the remote operation before switching branches".into());
+            }
             return;
         }
-        let Some((idx, name)) = self.branch_popup.as_ref().and_then(|bp| {
+        let Some((idx, name, is_remote)) = self.branch_popup.as_ref().and_then(|bp| {
             bp.branches
                 .get(bp.scroll.selected())
-                .map(|b| (bp.entry_idx, b.name.clone()))
+                .map(|b| (bp.entry_idx, b.name.clone(), b.is_remote))
         }) else {
             return;
         };
+        if !self.require_action_note() {
+            return;
+        }
         let session = match self.ensure_session() {
             Ok(id) => id,
             Err(e) => {
@@ -1668,14 +1627,19 @@ impl App {
         let Some(repo) = repo else {
             return;
         };
-        match crate::repository_history::run(
+        match crate::repository_history::run_noted(
             &root,
             &session,
             "branch switch",
             &module,
             &name,
+            &self.action_note,
             || {
-                gitops::switch_branch(repo, &name)?;
+                if is_remote {
+                    gitops::switch_remote_branch(repo, &name)?;
+                } else {
+                    gitops::switch_branch(repo, &name)?;
+                }
                 Ok(format!("Selected branch {name}"))
             },
         ) {
@@ -1696,6 +1660,7 @@ impl App {
     fn handle_save_key(&mut self, code: KeyCode) {
         let confirming = matches!(self.save_popup, Some(SaveStage::Confirm(_)));
         match code {
+            KeyCode::Char('n') if confirming => self.action_note_editing = true,
             KeyCode::Enter if confirming => self.apply_saves(),
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => self.save_popup = None,
             KeyCode::Enter => self.save_popup = None, // result popup: close
@@ -1716,6 +1681,8 @@ impl App {
         }
         self.refresh();
         let changes = self.pending_saves();
+        self.action_note.clear();
+        self.action_note_editing = !changes.is_empty();
         self.save_popup = Some(SaveStage::Confirm(changes));
     }
 
@@ -1769,6 +1736,7 @@ impl App {
     /// submodule pointer. Failures are collected, never abort the run, and
     /// keep their pick for a retry.
     fn apply_saves(&mut self) {
+        self.action_note_editing = false;
         if self.is_pulling() {
             return;
         }
@@ -1793,6 +1761,9 @@ impl App {
             plan.push((idx, self.entry_name(idx), path, pick, current));
         }
 
+        if !plan.is_empty() && !self.require_action_note() {
+            return;
+        }
         let mut outcome = ApplyOutcome::default();
         let session = match self.ensure_session() {
             Ok(id) => id,
@@ -1805,14 +1776,25 @@ impl App {
             }
         };
         let root = self.overview.as_ref().unwrap().root.clone();
+        let note_group = match crate::session::identifier() {
+            Ok(id) => id,
+            Err(e) => {
+                self.status = format!("Save not started: {e:#}");
+                return;
+            }
+        };
         let repo = self.repo.take();
         for (idx, name, path, pick, current) in plan {
-            let result = crate::repository_history::run(
+            let result = crate::repository_history::run_grouped(
                 &root,
                 &session,
                 "commit pick",
                 path.as_deref().unwrap_or("."),
                 &pick.to_string(),
+                &crate::repository_history::Annotation {
+                    note: &self.action_note,
+                    group: Some(&note_group),
+                },
                 || {
                     let result = if idx == 0 {
                         match repo.as_ref() {
@@ -2147,7 +2129,7 @@ fn short_oid(oid: git2::Oid) -> String {
 mod tests {
     use super::*;
     use crate::fixture::{self, BASE_TIME, SubSpec, TempDir};
-    use crossterm::event::MouseButton;
+    use crossterm::event::{MouseButton, MouseEventKind};
     use std::fs;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2200,7 +2182,7 @@ mod tests {
     fn not_repo_quit_paths() {
         let mut app = App::not_repo(Path::new("/x"));
         assert!(!app.should_quit);
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert!(app.should_quit);
 
         let mut app = App::not_repo(Path::new("/x"));
@@ -2215,7 +2197,7 @@ mod tests {
     #[test]
     fn error_mode_also_exits_on_ok() {
         let mut app = App::error(Path::new("/x"), "boom");
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert!(app.should_quit);
     }
 
@@ -2240,7 +2222,7 @@ mod tests {
             form.activate();
             form.paste("2");
             form.commit_input().unwrap();
-            form.save().unwrap();
+            form.save_with_note("Test config change").unwrap();
             paths.push(path);
         }
         app.handle_key(key(KeyCode::Char('h')));
@@ -2277,7 +2259,7 @@ mod tests {
             Some(config::Overlay::Save { .. })
         ));
         assert_eq!(fs::read_to_string(&paths[1]).unwrap(), "gain: 2\n");
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(fs::read_to_string(&paths[1]).unwrap(), "gain: 1\n");
         assert_eq!(fs::read_to_string(&paths[0]).unwrap(), "gain: 2\n");
         assert_eq!(
@@ -2309,15 +2291,15 @@ mod tests {
         assert_eq!(app.config_modules.len(), 1);
         assert_eq!(app.config_modules[0].entry_idx, 1);
         app.handle_key(key(KeyCode::Tab));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Char('2')));
         assert!(
             !app.form.as_ref().unwrap().dirty(),
             "typing outside a value input cannot edit YAML"
         );
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Char('2')));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Esc));
         assert!(app.form.is_some(), "unsaved edits prevent accidental close");
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
@@ -2334,7 +2316,7 @@ mod tests {
             "gain: 1\n",
             "save needs confirmation"
         );
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(fs::read_to_string(&file).unwrap(), "gain: 2\n");
         app.handle_key(key(KeyCode::Esc));
         app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
@@ -2358,8 +2340,8 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert_eq!(app.view, View::Configurations);
         assert!(app.config_modules.is_empty());
-        app.handle_key(key(KeyCode::Enter));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
+        crate::fixture::confirm_action(&mut app);
         assert!(app.form.is_none());
     }
 
@@ -2390,7 +2372,14 @@ mod tests {
             app.network_job.is_none(),
             "shortcut only requests confirmation"
         );
-        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing);
+        app.handle_paste("Refresh before testing");
+        crate::fixture::confirm_action(&mut app);
+        assert!(
+            app.network_job.is_none(),
+            "finishing a note does not start a pull"
+        );
+        crate::fixture::confirm_action(&mut app);
         assert!(app.network_job.is_some());
         let deadline = Instant::now() + Duration::from_secs(5);
         while app.network_job.is_some() {
@@ -2409,15 +2398,377 @@ mod tests {
         assert!(
             events
                 .iter()
-                .all(|e| e.intent.session == app.session.as_ref().unwrap().id)
+                .all(|e| e.intent.session == app.session.as_ref().unwrap().id
+                    && e.intent.note == "Refresh before testing")
         );
+    }
+
+    #[test]
+    fn selected_pull_updates_only_its_frozen_target_then_pull_all_still_updates_the_stack()
+    -> Result<()> {
+        let temp = TempDir::new("app-selected-pull")?;
+        let root = temp.path().join("super");
+        let stack = fixture::make_super(
+            &root,
+            &[
+                SubSpec {
+                    name: "subA",
+                    msgs: &["a1", "a2"],
+                    recorded: None,
+                    drop_workdir: false,
+                },
+                SubSpec {
+                    name: "subB",
+                    msgs: &["b1", "b2"],
+                    recorded: None,
+                    drop_workdir: false,
+                },
+            ],
+        )?;
+        let mut tips = Vec::new();
+        for (idx, path) in [&root, &root.join("subA"), &root.join("subB")]
+            .into_iter()
+            .enumerate()
+        {
+            let local = Repository::open(path)?;
+            let old = local.head()?.target().unwrap();
+            let remote_path = temp.path().join(format!("remote-{idx}"));
+            let remote = Repository::clone(path.to_str().unwrap(), &remote_path)?;
+            local.remote("origin", remote_path.to_str().unwrap())?;
+            local.reference("refs/remotes/origin/main", old, false, "fixture upstream")?;
+            local
+                .find_branch("main", git2::BranchType::Local)?
+                .set_upstream(Some("origin/main"))?;
+            let new = fixture::commit_file(
+                &remote,
+                "latest.txt",
+                "new\n",
+                "Remote trial",
+                BASE_TIME + 10_000 + idx as i64,
+            )?;
+            tips.push((old, new));
+        }
+        let mut app = App::normal(gitx::overview(&stack.repo)?, stack.repo);
+        app.entries[2].pick = Some(stack.sub_oids["subB"][0]);
+        app.select_repo(1);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.pull_target.as_ref().unwrap().name, "subA");
+        assert!(app.action_note_editing && app.network_job.is_none());
+        app.select_repo(2); // Selection drift cannot retarget an existing confirmation.
+        app.handle_paste("Update steering module");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.session.is_none());
+        app.handle_key(key(KeyCode::Enter));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.network_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_network();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.network_results.len(), 1);
+        assert_eq!(app.network_results[0].0, "subA");
+        assert!(
+            app.network_results[0].1.is_ok(),
+            "{:?}",
+            app.network_results
+        );
+        assert_eq!(app.entries[2].pick, Some(stack.sub_oids["subB"][0]));
+        for (idx, path) in [&root, &root.join("subA"), &root.join("subB")]
+            .into_iter()
+            .enumerate()
+        {
+            let repo = Repository::open(path)?;
+            let expected = if idx == 1 { tips[idx].1 } else { tips[idx].0 };
+            assert_eq!(repo.head()?.target(), Some(expected));
+            assert_eq!(
+                repo.find_reference("refs/remotes/origin/main")?.target(),
+                Some(expected),
+                "unselected refs are not fetched"
+            );
+        }
+        let events = crate::repository_history::events(&root)?.0;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].intent.subject, "subA");
+        assert_eq!(events[0].intent.note, "Update steering module");
+        let overview = app.overview.as_ref().unwrap();
+        assert_eq!(
+            overview.submodules[0].index_oid,
+            Some(tips[1].0),
+            "pull never stages a new submodule pointer"
+        );
+        app.handle_key(key(KeyCode::Esc));
+        app.entries[2].pick = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(
+            app.pull_target.is_none(),
+            "all shortcut resets the previous selected scope"
+        );
+        app.handle_paste("Update entire stack");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.network_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_network();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.network_results.len(), 3);
+        assert!(
+            app.network_results.iter().all(|(_, result)| result.is_ok()),
+            "{:?}",
+            app.network_results
+        );
+        for (idx, path) in [&root, &root.join("subA"), &root.join("subB")]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(Repository::open(path)?.head()?.target(), Some(tips[idx].1));
+        }
+        assert_eq!(crate::history::Browser::open(&root)?.notes().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_pull_requires_a_note_and_blocks_only_target_picks_or_uninitialized_targets() {
+        let (mut app, _temp) = normal_app();
+        app.select_repo(1);
+        let pick = app.entries[1].log.get(1).unwrap().oid;
+        app.entries[1].pick = Some(pick);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.popup.is_none() && app.network_job.is_none());
+        assert!(app.status.contains("selected repository"));
+        assert_eq!(app.entries[1].pick, Some(pick));
+        app.entries[1].pick = None;
+        app.entries[0].pick = app
+            .repo
+            .as_ref()
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_id(0)
+            .ok();
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.popup, Some(Popup::PullConfirm));
+        assert!(app.action_note_editing);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none() && app.network_job.is_none());
+        app.handle_paste(" ");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.popup.is_none());
+        app.request_pull();
+        assert!(
+            app.popup.is_none(),
+            "all pulls still block every pending pick"
+        );
+        app.entries[0].pick = None;
+        app.select_repo(2);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.popup.is_none() && app.session.is_none() && app.network_job.is_none());
+        assert!(app.status.contains("not initialized"));
+        app.select_repo(0);
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(
+            app.pull_target.as_ref().unwrap().path.as_ref(),
+            Some(&app.overview.as_ref().unwrap().root)
+        );
+        crate::fixture::confirm_action(&mut app);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.network_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_network();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            app.network_results.len(),
+            1,
+            "selected main repository is also supported"
+        );
+    }
+
+    #[test]
+    fn config_module_and_branch_picker_pull_use_their_selected_repository() -> Result<()> {
+        let (mut app, temp) = normal_app();
+        let file = temp.path().join("super/subA/config/params.yaml");
+        fs::create_dir_all(file.parent().unwrap())?;
+        fs::write(&file, "gain: 1\n")?;
+        app.switch_view(View::Configurations);
+        assert_eq!(
+            app.repos.selected(),
+            0,
+            "repository cursor is deliberately different"
+        );
+        app.handle_key(key(KeyCode::Char('p')));
+        assert_eq!(app.pull_target.as_ref().unwrap().name, "subA");
+        app.handle_key(key(KeyCode::Esc));
+        app.switch_view(View::Repositories);
+        app.select_repo(1);
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('p')));
+        assert!(app.branch_popup.is_none());
+        assert_eq!(app.pull_target.as_ref().unwrap().name, "subA");
+        assert!(app.action_note_editing && app.session.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn three_repository_save_has_one_note_but_separate_saves_keep_identical_notes() -> Result<()> {
+        let temp = TempDir::new("app-batch-notes")?;
+        let root = temp.path().join("super");
+        let sup = fixture::make_super(
+            &root,
+            &[
+                SubSpec {
+                    name: "subA",
+                    msgs: &["a1", "a2"],
+                    recorded: None,
+                    drop_workdir: false,
+                },
+                SubSpec {
+                    name: "subB",
+                    msgs: &["b1", "b2"],
+                    recorded: None,
+                    drop_workdir: false,
+                },
+                SubSpec {
+                    name: "subC",
+                    msgs: &["c1", "c2"],
+                    recorded: None,
+                    drop_workdir: false,
+                },
+            ],
+        )?;
+        let mut app = App::normal(gitx::overview(&sup.repo)?, sup.repo);
+        for (idx, name) in [(1, "subA"), (2, "subB"), (3, "subC")] {
+            app.select_repo(idx);
+            app.entries[idx].pick = Some(sup.sub_oids[name][0]);
+        }
+        app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.action_note_editing);
+        app.handle_paste("Same test note");
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.session.is_none(), "finishing notes never writes");
+        app.handle_key(key(KeyCode::Enter));
+        let browser = crate::history::Browser::open(&root)?;
+        assert_eq!(browser.repository_events.len(), 3);
+        assert_eq!(browser.notes().len(), 1);
+        for name in ["subA", "subB", "subC"] {
+            assert!(browser.notes()[0].0.contains(name));
+        }
+        let first_group = browser.repository_events[0].intent.note_group.clone();
+        assert!(first_group.is_some());
+        assert!(
+            browser
+                .repository_events
+                .iter()
+                .all(|e| e.intent.note_group == first_group)
+        );
+        app.handle_key(key(KeyCode::Enter)); // close result
+        app.entries[1].pick = Some(sup.sub_oids["subA"][1]);
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_paste("Same test note");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        app.finish_session()?;
+        drop(app);
+        let mut browser = crate::history::Browser::open(&root)?;
+        assert_eq!(
+            browser.notes().len(),
+            2,
+            "separate confirmations must never collapse by note text"
+        );
+        assert!(
+            browser
+                .notes()
+                .iter()
+                .all(|(_, note)| note == "Same test note")
+        );
+        browser.key(KeyCode::Enter, KeyModifiers::NONE, 10);
+        assert_eq!(
+            browser.notes().len(),
+            2,
+            "drilling into an action preserves grouped session notes"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn branch_picker_fetches_remote_branches_without_checkout_then_prompts_for_tracking_switch()
+    -> Result<()> {
+        let temp = TempDir::new("app-fetch-branches")?;
+        let (remote, _) = fixture::make_history(&temp.path().join("remote"), &["initial"])?;
+        let root = temp.path().join("local");
+        let local = Repository::clone(remote.workdir().unwrap().to_str().unwrap(), &root)?;
+        let initial = local.head()?.target();
+        let new_commit = fixture::commit_file(
+            &remote,
+            "test.txt",
+            "trial\n",
+            "Trial commit",
+            BASE_TIME + 100,
+        )?;
+        remote.branch("test/track", &remote.find_commit(new_commit)?, false)?;
+        let overview = gitx::overview(&local)?;
+        let mut app = App::normal(overview, local);
+        app.handle_key(key(KeyCode::Char('b')));
+        assert!(
+            !app.branch_popup
+                .as_ref()
+                .unwrap()
+                .branches
+                .iter()
+                .any(|b| b.name == "origin/test/track")
+        );
+        app.handle_key(key(KeyCode::Char('f')));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.network_job.is_some() {
+            assert!(Instant::now() < deadline);
+            app.poll_network();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(app.repo.as_ref().unwrap().head()?.target(), initial);
+        assert!(
+            app.session.is_none(),
+            "fetch-only has no checkout or documentation requirement"
+        );
+        let popup = app.branch_popup.as_mut().unwrap();
+        let row = popup
+            .branches
+            .iter()
+            .position(|b| b.name == "origin/test/track" && b.is_remote)
+            .unwrap();
+        popup.scroll.select(row);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        app.handle_paste("Try track branch");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.branch_popup.is_none());
+        let repo = app.repo.as_ref().unwrap();
+        assert_eq!(repo.head()?.shorthand(), Some("test/track"));
+        assert_eq!(repo.head()?.target(), Some(new_commit));
+        assert_eq!(
+            repo.find_branch("test/track", git2::BranchType::Local)?
+                .upstream()?
+                .name()?,
+            Some("origin/test/track")
+        );
+        assert_eq!(
+            crate::repository_history::events(&root)?.0[0].intent.note,
+            "Try track branch"
+        );
+        Ok(())
     }
 
     #[test]
     fn pull_confirmation_is_modal_and_cancellation_never_starts_a_worker() {
         let (mut app, _temp) = normal_app();
         assert!(app.network_job.is_none(), "startup has no remote operation");
-        for cancel in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('n')] {
+        for cancel in [KeyCode::Esc, KeyCode::Char('q'), KeyCode::Char('Q')] {
             app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
             app.handle_key(key(KeyCode::Char('p')));
             assert_eq!(app.popup, Some(Popup::PullConfirm));
@@ -2425,11 +2776,101 @@ mod tests {
             app.handle_key(key(KeyCode::Char('s')));
             assert!(app.network_job.is_none());
             assert!(app.save_popup.is_none());
+            if cancel != KeyCode::Esc {
+                app.handle_key(key(KeyCode::Enter));
+            }
             app.handle_key(key(cancel));
             assert_eq!(app.popup, None);
             assert!(app.network_job.is_none());
             assert!(!app.should_quit);
         }
+    }
+
+    #[test]
+    fn missing_notes_block_repository_actions_before_creating_a_session() {
+        let (mut app, _temp) = branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        assert_eq!(
+            app.repo.as_ref().unwrap().head().unwrap().shorthand(),
+            Some("main")
+        );
+        app.handle_paste(" ");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_paste("x");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.repo.as_ref().unwrap().head().unwrap().shorthand(),
+            Some("feature")
+        );
+        assert!(!app.status.starts_with("A note is required:"));
+        assert_eq!(
+            crate::repository_history::events(&app.overview.as_ref().unwrap().root)
+                .unwrap()
+                .0[0]
+                .intent
+                .note,
+            "x"
+        );
+
+        let (mut app, _temp) = normal_app();
+        let pick = pick_sub_a_older(&mut app);
+        let before = app.workdir_oid(1);
+        app.handle_key(key(KeyCode::Char('s')));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        assert_eq!(app.entries[1].pick, Some(pick));
+        assert_eq!(app.workdir_oid(1), before);
+        app.handle_paste("x");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.workdir_oid(1), Some(pick));
+
+        let (mut app, _temp) = normal_app();
+        app.request_pull();
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        assert!(app.network_job.is_none());
+        assert_eq!(app.popup, Some(Popup::PullConfirm));
+    }
+
+    #[test]
+    fn repository_note_input_does_not_apply_and_cancelled_notes_do_not_leak() {
+        let (mut app, _temp) = branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_paste("Trial branch\n\u{1b}");
+        crate::fixture::confirm_action(&mut app);
+        assert_eq!(app.action_note, "Trial branch");
+        assert!(!app.action_note_editing);
+        assert_eq!(
+            app.repo.as_ref().unwrap().head().unwrap().shorthand(),
+            Some("main")
+        );
+        assert!(
+            app.session.is_none(),
+            "finishing a note never saves a change"
+        );
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Char('b')));
+        assert!(app.action_note.is_empty());
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_paste(&"λ".repeat(600));
+        assert_eq!(app.action_note.chars().count(), 500);
+        app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.handle_paste("Use trial branch");
+        crate::fixture::confirm_action(&mut app);
+        crate::fixture::confirm_action(&mut app);
+        let events = crate::repository_history::events(&app.overview.as_ref().unwrap().root)
+            .unwrap()
+            .0;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].intent.note, "Use trial branch");
     }
 
     #[test]
@@ -2593,42 +3034,31 @@ mod tests {
     }
 
     #[test]
-    fn click_selects_repo_row_and_focuses_pane() {
-        let (mut app, _t) = normal_app();
-        app.focus = Focus::Commits;
-        app.hit_zones = vec![
-            (Rect::new(2, 2, 20, 1), Hit::RepoRow(2)),
-            (Rect::new(0, 1, 30, 20), Hit::PaneRepos),
-            (Rect::new(31, 1, 40, 20), Hit::PaneCommits),
-        ];
-
+    fn mouse_rows_do_not_select_or_focus() {
+        let (mut app, _temp) = normal_app();
+        app.hit_zones = vec![(Rect::new(0, 0, 20, 10), Hit::RepoRow(1))];
         app.handle_mouse(click(5, 2));
+        assert_eq!(app.repos.selected(), 0);
         assert_eq!(app.focus, Focus::Repos);
-        assert_eq!(app.repos.selected(), 2);
-        assert!(app.entries[2].loaded, "clicked entry loads immediately");
-
-        // Clicking the commits pane (not a row) just moves focus.
-        app.handle_mouse(click(40, 5));
-        assert_eq!(app.focus, Focus::Commits);
-        assert_eq!(app.repos.selected(), 2);
     }
 
     #[test]
-    fn click_with_help_open_just_dismisses() {
-        let (mut app, _t) = normal_app();
+    fn mouse_does_not_dismiss_help() {
+        let (mut app, _temp) = normal_app();
         app.popup = Some(Popup::Help);
-        app.hit_zones = vec![(Rect::new(2, 2, 20, 1), Hit::RepoRow(1))];
-
         app.handle_mouse(click(5, 2));
-        assert_eq!(app.popup, None);
-        assert_eq!(app.repos.selected(), 0, "selection must not change");
+        assert_eq!(app.popup, Some(Popup::Help));
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.popup.is_none());
     }
 
     #[test]
-    fn clicking_ok_button_quits() {
+    fn mouse_does_not_quit_outside_a_repo() {
         let mut app = App::not_repo(Path::new("/x"));
-        app.hit_zones = vec![(Rect::new(36, 13, 8, 1), Hit::OkButton)];
+        app.hit_zones = vec![(Rect::new(30, 13, 20, 1), Hit::OkButton)];
         app.handle_mouse(click(40, 13));
+        assert!(!app.should_quit);
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.should_quit);
     }
 
@@ -2667,18 +3097,18 @@ mod tests {
         app.handle_key(key(KeyCode::Tab)); // focus commits
 
         // Row 0 is the recorded commit (main HEAD): picking it is a no-op.
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(app.entries[0].pick, None);
 
         // Move to the older commit and pick it.
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         let picked = app.entries[0].pick.expect("pick recorded");
         assert_eq!(app.entries[0].log.get(1).map(|c| c.oid), Some(picked));
         assert_ne!(Some(picked), app.current_oid(0));
 
         // Enter again un-picks.
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(app.entries[0].pick, None);
     }
 
@@ -2722,13 +3152,13 @@ mod tests {
         for c in "COMMIT 3".chars() {
             app.handle_key(key(KeyCode::Char(c)));
         }
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert!(!app.filter_editing);
         assert_eq!(app.entries[0].visible.len(), 11);
         app.handle_key(key(KeyCode::End));
         let original = *app.entries[0].visible.last().unwrap();
         assert_eq!(app.entries[0].log.get(original).unwrap().title, "commit 3");
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(
             app.entries[0].pick,
             app.entries[0].log.get(original).map(|c| c.oid)
@@ -2748,7 +3178,7 @@ mod tests {
         app.handle_key(key(KeyCode::Char('/')));
         app.handle_key(key(KeyCode::Char('a')));
         app.handle_key(key(KeyCode::Char('1')));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(app.entries[0].visible.len(), 0);
 
         app.select_repo(1);
@@ -2781,26 +3211,23 @@ mod tests {
     }
 
     #[test]
-    fn wheel_scrolls_the_focused_pane() {
-        let (mut app, _t) = normal_app();
-        app.focus = Focus::Commits;
-
+    fn mouse_wheel_does_not_scroll() {
+        let (mut app, _temp) = normal_app();
         app.handle_mouse(wheel(MouseEventKind::ScrollDown));
-        // Main history has 2 commits, so 3 notches clamp to the last row.
-        assert_eq!(app.entries[0].scroll.selected(), 1);
-
         app.handle_mouse(wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.repos.selected(), 0);
+        app.focus = Focus::Commits;
+        app.handle_mouse(wheel(MouseEventKind::ScrollDown));
         assert_eq!(app.entries[0].scroll.selected(), 0);
     }
 
     #[test]
-    fn clicking_a_commit_row_selects_it() {
-        let (mut app, _t) = normal_app();
-        app.hit_zones = vec![(Rect::new(40, 5, 30, 1), Hit::CommitRow(1))];
-
+    fn mouse_commit_rows_do_not_select() {
+        let (mut app, _temp) = normal_app();
+        app.hit_zones = vec![(Rect::new(30, 5, 40, 1), Hit::CommitRow(1))];
         app.handle_mouse(click(45, 5));
-        assert_eq!(app.focus, Focus::Commits);
-        assert_eq!(app.entries[0].scroll.selected(), 1);
+        assert_eq!(app.focus, Focus::Repos);
+        assert_eq!(app.entries[0].scroll.selected(), 0);
     }
 
     #[test]
@@ -2808,7 +3235,7 @@ mod tests {
         let (mut app, _t) = normal_app();
         app.handle_key(key(KeyCode::Tab)); // commits
         app.handle_key(key(KeyCode::Down)); // row 1
-        app.handle_key(key(KeyCode::Enter)); // pick
+        crate::fixture::confirm_action(&mut app); // pick
         let pick = app.entries[0].pick.expect("pick set");
 
         app.handle_key(key(KeyCode::Char('r')));
@@ -2828,7 +3255,7 @@ mod tests {
         let (mut app, _t) = normal_app();
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         let pick = app.entries[0].pick.expect("pick set");
 
         gitops::checkout_oid(app.repo.as_ref().unwrap(), pick).unwrap();
@@ -2908,7 +3335,7 @@ mod tests {
     fn branch_switch_updates_state_and_closes_popup() {
         let (mut app, _t) = branchy_app();
         app.handle_key(key(KeyCode::Char('b')));
-        app.handle_key(key(KeyCode::Enter)); // switch to `feature` (row 0)
+        crate::fixture::confirm_action(&mut app); // switch to `feature` (row 0)
 
         assert!(app.branch_popup.is_none(), "popup closes on success");
         let ov = app.overview.as_ref().unwrap();
@@ -2945,7 +3372,7 @@ mod tests {
         let mut app = App::normal(ov, repo);
 
         app.handle_key(key(KeyCode::Char('b')));
-        app.handle_key(key(KeyCode::Enter)); // row 0 = feature → refused
+        crate::fixture::confirm_action(&mut app); // row 0 = feature → refused
 
         let bp = app.branch_popup.as_ref().expect("popup stays open");
         let notice = bp.notice.as_deref().expect("error shown");
@@ -2958,7 +3385,7 @@ mod tests {
 
         // Once the tree is clean again, the same switch succeeds.
         fs::write(root.join("f.txt"), "two\n").unwrap();
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert!(app.branch_popup.is_none());
         assert_eq!(
             app.overview.as_ref().unwrap().head,
@@ -3009,7 +3436,7 @@ mod tests {
         );
 
         app.handle_key(key(KeyCode::Down)); // → old
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
 
         assert!(app.branch_popup.is_none());
         let ov = app.overview.as_ref().unwrap();
@@ -3041,7 +3468,7 @@ mod tests {
         assert!(notice.contains("not initialized"), "got: {notice}");
 
         // Enter does nothing (nothing to switch to); Esc closes.
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert!(app.branch_popup.is_some());
         app.handle_key(key(KeyCode::Esc));
         assert!(app.branch_popup.is_none());
@@ -3053,43 +3480,35 @@ mod tests {
         // Pick the older commit on the main repo.
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         let pick = app.entries[0].pick.expect("pick set");
 
         app.handle_key(key(KeyCode::Tab)); // back to repos
         app.handle_key(key(KeyCode::Char('b')));
-        app.handle_key(key(KeyCode::Enter)); // switch to feature
+        crate::fixture::confirm_action(&mut app); // switch to feature
 
         assert_eq!(app.entries[0].pick, Some(pick), "pick survives the switch");
     }
 
     #[test]
-    fn wheel_and_click_work_in_branch_popup() {
-        let (mut app, _t) = branchy_app();
+    fn branch_popup_ignores_mouse_and_prompts_for_notes_on_enter() {
+        let (mut app, _temp) = branchy_app();
         app.handle_key(key(KeyCode::Char('b')));
-
         app.handle_mouse(wheel(MouseEventKind::ScrollDown));
-        assert_eq!(
-            app.branch_popup.as_ref().unwrap().scroll.selected(),
-            1,
-            "wheel moves the popup selection"
-        );
-
-        app.hit_zones = vec![(Rect::new(10, 10, 20, 1), Hit::BranchRow(0))];
         app.handle_mouse(click(15, 10));
-        assert!(
-            app.branch_popup.is_none(),
-            "click on a row switches and closes"
-        );
+        app.handle_mouse(click(70, 2));
+        assert_eq!(app.branch_popup.as_ref().unwrap().scroll.selected(), 0);
+        assert!(!app.action_note_editing && app.session.is_none());
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing && app.session.is_none());
+        app.handle_paste("Trial branch");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.branch_popup.is_none());
         assert_eq!(
             app.overview.as_ref().unwrap().head,
             crate::gitx::HeadInfo::Branch("feature".into())
         );
-
-        // A click outside any row just closes the popup.
-        app.handle_key(key(KeyCode::Char('b')));
-        app.handle_mouse(click(70, 2));
-        assert!(app.branch_popup.is_none());
     }
 
     // ---- step 7: save flow ----------------------------------------------
@@ -3100,7 +3519,7 @@ mod tests {
         app.handle_key(key(KeyCode::Down)); // repos → subA
         app.handle_key(key(KeyCode::Tab)); // commits
         app.handle_key(key(KeyCode::Down)); // row 1 = a1
-        app.handle_key(key(KeyCode::Enter)); // pick
+        crate::fixture::confirm_action(app); // pick
         app.entries[1].pick.expect("pick set")
     }
 
@@ -3151,7 +3570,7 @@ mod tests {
             .unwrap();
 
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter)); // apply
+        crate::fixture::confirm_action(&mut app); // apply
 
         // Result popup: one success, no failures; pick cleared.
         match &app.save_popup {
@@ -3199,11 +3618,11 @@ mod tests {
         // Pick the root commit of the main repo.
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Down)); // row 1 = root
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         let pick = app.entries[0].pick.expect("pick set");
 
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
 
         let ov = app.overview.as_ref().unwrap();
         assert_eq!(ov.head, crate::gitx::HeadInfo::Detached(pick));
@@ -3235,7 +3654,7 @@ mod tests {
         app.handle_key(key(KeyCode::Tab));
         app.handle_key(key(KeyCode::Down)); // row 1 = a2
         app.handle_key(key(KeyCode::Down)); // row 2 = a1
-        app.handle_key(key(KeyCode::Enter)); // pick a1
+        crate::fixture::confirm_action(&mut app); // pick a1
         let pick = app.entries[1].pick.expect("pick set");
         assert_ne!(Some(pick), app.current_oid(1));
 
@@ -3247,7 +3666,7 @@ mod tests {
             }
             other => panic!("expected Confirm, got {other:?}"),
         }
-        app.handle_key(key(KeyCode::Enter)); // apply → refused
+        crate::fixture::confirm_action(&mut app); // apply → refused
 
         match &app.save_popup {
             Some(SaveStage::Result(outcome)) => {
@@ -3275,7 +3694,7 @@ mod tests {
         app.handle_key(key(KeyCode::Esc)); // close result
         fs::write(root.join("subA/file0.txt"), "content of file0.txt\n").unwrap();
         app.handle_key(key(KeyCode::Char('s')));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         match &app.save_popup {
             Some(SaveStage::Result(outcome)) => {
                 assert_eq!(outcome.applied.len(), 1);
@@ -3316,7 +3735,7 @@ mod tests {
             Some(SaveStage::Confirm(changes)) => assert!(changes.is_empty()),
             other => panic!("expected Confirm, got {other:?}"),
         }
-        app.handle_key(key(KeyCode::Enter)); // apply empty plan
+        crate::fixture::confirm_action(&mut app); // apply empty plan
         match &app.save_popup {
             Some(SaveStage::Result(outcome)) => {
                 assert!(outcome.applied.is_empty());
@@ -3332,41 +3751,30 @@ mod tests {
     }
 
     #[test]
-    fn save_click_buttons_apply_and_cancel() {
-        let (mut app, _t) = normal_app();
+    fn save_automatically_opens_notes_and_ignores_mouse() {
+        let (mut app, _temp) = normal_app();
         let pick = pick_sub_a_older(&mut app);
-
-        // Cancel button: nothing happens.
         app.handle_key(key(KeyCode::Char('s')));
+        assert!(app.action_note_editing && app.action_note.is_empty());
         app.hit_zones = vec![
-            (Rect::new(5, 5, 60, 10), Hit::SavePopup),
             (Rect::new(10, 14, 9, 1), Hit::SaveApply),
             (Rect::new(30, 14, 10, 1), Hit::SaveCancel),
         ];
-        app.handle_mouse(click(35, 14)); // Cancel
-        assert!(app.save_popup.is_none());
-        assert_eq!(app.entries[1].pick, Some(pick));
-
-        // A click inside the popup body does nothing.
-        app.handle_key(key(KeyCode::Char('s')));
-        app.handle_mouse(click(20, 8)); // SavePopup zone
-        assert!(app.save_popup.is_some(), "body clicks are ignored");
-
-        // Apply button: applies and shows the result.
-        app.handle_mouse(click(12, 14)); // Apply
-        match &app.save_popup {
-            Some(SaveStage::Result(outcome)) => assert_eq!(outcome.applied.len(), 1),
-            other => panic!("expected Result, got {other:?}"),
-        }
-        let ov = app.overview.as_ref().unwrap();
-        assert_eq!(ov.submodules[0].index_oid, Some(pick));
-
-        // OK button on the result popup closes it.
-        app.hit_zones = vec![
-            (Rect::new(5, 5, 60, 10), Hit::SavePopup),
-            (Rect::new(30, 14, 6, 1), Hit::SaveOk),
-        ];
+        app.handle_mouse(click(35, 14));
+        app.handle_mouse(click(12, 14));
+        assert!(app.session.is_none() && app.save_popup.is_some());
+        app.handle_paste("Commit trial");
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_mouse(click(12, 14));
+        assert!(app.session.is_none());
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            app.overview.as_ref().unwrap().submodules[0].index_oid,
+            Some(pick)
+        );
         app.handle_mouse(click(32, 14));
+        assert!(matches!(app.save_popup, Some(SaveStage::Result(_))));
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.save_popup.is_none());
     }
 }

@@ -21,6 +21,7 @@ pub enum Operation {
     Pull,
 }
 
+#[derive(Clone)]
 pub struct Target {
     pub name: String,
     pub path: Option<PathBuf>,
@@ -45,6 +46,8 @@ pub fn start_cancellable(
 pub struct Recording {
     pub root: PathBuf,
     pub session: String,
+    pub note: String,
+    pub note_group: String,
 }
 
 pub fn start_recorded(
@@ -95,12 +98,16 @@ pub fn start_recorded(
                     } else {
                         "."
                     });
-                crate::repository_history::run(
+                crate::repository_history::run_grouped(
                     &recording.root,
                     &recording.session,
                     "pull",
                     subject,
                     &target.name,
+                    &crate::repository_history::Annotation {
+                        note: &recording.note,
+                        group: Some(&recording.note_group),
+                    },
                     action,
                 )
             } else {

@@ -57,6 +57,7 @@ pub struct Summary {
     pub commit: String,
     pub note: String,
     pub state: String,
+    pub note_group: Option<String>,
     pub changes: usize,
     pub path: String,
     pub module: String,
@@ -391,6 +392,8 @@ pub struct Browser {
     pub before: bool,
     pub diff_scroll: usize,
     pub diff_focus: bool,
+    pub notes_focus: bool,
+    pub notes_scroll: usize,
     pub filter: String,
     pub filtering: bool,
     pub file_filter: Option<String>,
@@ -443,6 +446,8 @@ impl Browser {
             before: false,
             diff_scroll: 0,
             diff_focus: false,
+            notes_focus: false,
+            notes_scroll: 0,
             filter: String::new(),
             filtering: false,
             file_filter: None,
@@ -783,6 +788,112 @@ impl Browser {
         }
     }
 
+    /// Notes for the entire selected session, even while inspecting one action/file.
+    /// Save/action notes remain attached to their immutable journal records.
+    pub fn notes(&self) -> Vec<(String, String)> {
+        let session = self.selected_session();
+        let mut changes = Vec::new();
+        let mut grouped = std::collections::BTreeMap::new();
+        if let Some(info) = session.as_ref().and_then(|id| self.infos.get(id)) {
+            for note in info.notes.iter().filter(|n| !n.text.is_empty()) {
+                let timestamp = note
+                    .id
+                    .split('-')
+                    .next()
+                    .and_then(|s| s.parse::<u128>().ok())
+                    .and_then(|n| i64::try_from(n / 1_000_000_000).ok())
+                    .unwrap_or(info.started);
+                changes.push((
+                    timestamp,
+                    note.id.clone(),
+                    format!("Session note · {}", time_text(timestamp)),
+                    note.text.clone(),
+                ));
+            }
+        }
+        for entry in &self.entries {
+            let belongs = if let Some(id) = &session {
+                entry.session.as_ref() == Some(id)
+            } else {
+                self.selected_row().is_some_and(|row| {
+                    self.indices(row).iter().any(|&i| {
+                        self.entries[i].id == entry.id && self.entries[i].path == entry.path
+                    })
+                })
+            };
+            if belongs && !entry.note.is_empty() {
+                if let Some(group) = &entry.note_group {
+                    let (timestamp, subjects) = grouped
+                        .entry((
+                            group.clone(),
+                            "Session restore".to_owned(),
+                            entry.note.clone(),
+                        ))
+                        .or_insert_with(|| (entry.timestamp, Vec::new()));
+                    *timestamp = (*timestamp).max(entry.timestamp);
+                    subjects.push(format!("{} ({})", entry.path, entry.state));
+                    continue;
+                }
+                changes.push((
+                    entry.timestamp,
+                    entry.id.clone(),
+                    format!("Config · {} · {}", entry.path, time_text(entry.timestamp)),
+                    entry.note.clone(),
+                ));
+            }
+        }
+        for event in &self.repository_events {
+            if session.as_deref() == Some(&event.intent.session) && !event.intent.note.is_empty() {
+                if let Some(group) = &event.intent.note_group {
+                    let key = (
+                        group.clone(),
+                        if event.intent.kind == "restore repository" {
+                            "Session restore".into()
+                        } else {
+                            event.intent.kind.clone()
+                        },
+                        event.intent.note.clone(),
+                    );
+                    let (timestamp, subjects) = grouped
+                        .entry(key)
+                        .or_insert_with(|| (event.intent.timestamp, Vec::new()));
+                    *timestamp = (*timestamp).max(event.intent.timestamp);
+                    subjects.push(format!("{} ({})", event.intent.subject, event.status));
+                    continue;
+                }
+                changes.push((
+                    event.intent.timestamp,
+                    event.intent.id.clone(),
+                    format!(
+                        "{} · {} · {} · {}",
+                        event.intent.kind,
+                        event.intent.subject,
+                        time_text(event.intent.timestamp),
+                        event.status
+                    ),
+                    event.intent.note.clone(),
+                ));
+            }
+        }
+        for ((group, kind, note), (timestamp, subjects)) in grouped {
+            changes.push((
+                timestamp,
+                group,
+                format!(
+                    "{kind} · {} · {}",
+                    subjects.join(", "),
+                    time_text(timestamp)
+                ),
+                note,
+            ));
+        }
+        changes.sort_by(|a, b| (&b.0, &b.1).cmp(&(&a.0, &a.1)));
+        changes
+            .into_iter()
+            .map(|(_, _, title, note)| (title, note))
+            .collect()
+    }
+
     pub fn repository_targets(&self) -> Result<Vec<crate::repository_history::Target>> {
         if let Some(HistoryRow::Recovery(i)) = self.selected_row() {
             let id = &self.recoveries[*i].id;
@@ -874,6 +985,7 @@ impl Browser {
         self.scroll.select(idx);
         self.record = None;
         self.diff_scroll = 0;
+        self.notes_scroll = 0;
         self.notice = if matches!(self.selected_row(), Some(HistoryRow::Recovery(_))) {
             "r reviews resume (after) · b selects rollback (before) · w shows each file's observed outcome".into()
         } else {
@@ -986,7 +1098,16 @@ impl Browser {
                             .contains(&needle)
                 });
                 let label_matches = self.file_filter.is_none()
-                    && (self.row_text(i).to_lowercase().contains(&needle) || repository_matches);
+                    && (self.row_text(i).to_lowercase().contains(&needle)
+                        || repository_matches
+                        || match row {
+                            HistoryRow::Session(id, _) => self.infos.get(id).is_some_and(|info| {
+                                info.notes
+                                    .iter()
+                                    .any(|note| note.text.to_lowercase().contains(&needle))
+                            }),
+                            _ => false,
+                        });
                 let recovery_matches = match row {
                     HistoryRow::Recovery(index) => self.recoveries[*index]
                         .targets
@@ -1021,6 +1142,15 @@ impl Browser {
     }
 
     pub fn comparison(&self) -> Result<Vec<Change>> {
+        self.comparison_impl(false)
+    }
+
+    /// Human-readable commits in the changes pane; audit/restore IDs stay intact.
+    pub fn display_comparison(&self) -> Result<Vec<Change>> {
+        self.comparison_impl(true)
+    }
+
+    fn comparison_impl(&self, display: bool) -> Result<Vec<Change>> {
         if !matches!(self.selected_row(), Some(HistoryRow::Save(_))) {
             let targets = self.targets()?;
             let mut changes = Vec::new();
@@ -1040,7 +1170,15 @@ impl Browser {
                     let Some(after) = target.after else {
                         changes.push(Change {
                             name: format!("{} · branch / checkout commit", target.before.module),
-                            before: target.before.head.describe(),
+                            before: if display {
+                                crate::repository_history::display_head(
+                                    &self.root,
+                                    &target.before.module,
+                                    &target.before.head,
+                                )
+                            } else {
+                                target.before.head.describe()
+                            },
                             after:
                                 "outcome unknown; select before (b) and r for a reviewed restore"
                                     .into(),
@@ -1049,24 +1187,41 @@ impl Browser {
                     };
                     (target.before, after)
                 };
-                changes.extend(crate::repository_history::changes(&from, &to, true));
+                changes.extend(if display {
+                    crate::repository_history::display_changes(&self.root, &from, &to, true)
+                } else {
+                    crate::repository_history::changes(&from, &to, true)
+                });
             }
             for i in self.event_indices() {
                 let event = &self.repository_events[i];
+                let present = |text: &str| {
+                    if display && event.intent.kind == "commit pick" {
+                        crate::repository_history::display_commit_text(
+                            &self.root,
+                            &event.intent.subject,
+                            text,
+                        )
+                    } else {
+                        text.to_owned()
+                    }
+                };
                 changes.push(Change {
                     name: format!(
                         "{} · {} · {}",
                         event.intent.subject, event.intent.kind, event.intent.id
                     ),
-                    before: format!("Requested: {}", event.intent.requested),
+                    before: format!("Requested: {}", present(&event.intent.requested)),
                     after: format!(
                         "{}: {}",
                         event.status,
-                        event
-                            .outcome
-                            .as_ref()
-                            .map(|o| o.detail.as_str())
-                            .unwrap_or("outcome unknown; no automatic rollback")
+                        present(
+                            event
+                                .outcome
+                                .as_ref()
+                                .map(|o| o.detail.as_str())
+                                .unwrap_or("outcome unknown; no automatic rollback")
+                        )
                     ),
                 });
             }
@@ -1224,17 +1379,12 @@ impl Browser {
                 }
             }
             KeyCode::Char('n') => {
-                if let Some(id) = self.selected_session() {
-                    self.description_input = Some(
-                        self.infos
-                            .get(&id)
-                            .map(|info| info.description.clone())
-                            .unwrap_or_default(),
-                    );
+                if self.selected_session().is_some() {
+                    self.description_input = Some(String::new());
+                    self.notes_scroll = 0;
                 } else {
                     self.notice =
-                        "Select a session to edit its description; legacy save notes are retained"
-                            .into();
+                        "Select a session to append a note; legacy save notes are retained".into();
                 }
             }
             KeyCode::Char('c') => {
@@ -1249,7 +1399,20 @@ impl Browser {
                 self.show_warnings = !self.show_warnings;
                 self.diff_scroll = 0;
             }
-            KeyCode::Tab | KeyCode::BackTab => self.diff_focus = !self.diff_focus,
+            KeyCode::Tab => {
+                (self.diff_focus, self.notes_focus) = match (self.diff_focus, self.notes_focus) {
+                    (false, false) => (true, false),
+                    (true, false) => (false, true),
+                    _ => (false, false),
+                };
+            }
+            KeyCode::BackTab => {
+                (self.diff_focus, self.notes_focus) = match (self.diff_focus, self.notes_focus) {
+                    (false, false) => (false, true),
+                    (false, true) => (true, false),
+                    _ => (false, false),
+                };
+            }
             KeyCode::Char('/') => self.filtering = true,
             KeyCode::Char('f') => {
                 self.file_filter = if self.file_filter.is_some() {
@@ -1264,6 +1427,20 @@ impl Browser {
                     self.notice = format!("Reload failed: {e:#}");
                 }
             }
+            KeyCode::Down | KeyCode::Char('j') if self.notes_focus => {
+                self.notes_scroll = self.notes_scroll.saturating_add(1)
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.notes_focus => {
+                self.notes_scroll = self.notes_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown if self.notes_focus => {
+                self.notes_scroll = self.notes_scroll.saturating_add(page.max(1))
+            }
+            KeyCode::PageUp if self.notes_focus => {
+                self.notes_scroll = self.notes_scroll.saturating_sub(page.max(1))
+            }
+            KeyCode::Home if self.notes_focus => self.notes_scroll = 0,
+            KeyCode::End if self.notes_focus => self.notes_scroll = usize::MAX,
             KeyCode::Down | KeyCode::Char('j') if self.diff_focus => {
                 self.diff_scroll = self.diff_scroll.saturating_add(1)
             }
@@ -1547,6 +1724,7 @@ impl Store {
                         commit: String::new(),
                         note: format!("{e:#}"),
                         state: "corrupt — restore blocked".into(),
+                        note_group: None,
                         changes: 0,
                         path: self.relative.clone(),
                         module: self.module.clone().unwrap_or_else(|| ".".into()),
@@ -1562,6 +1740,13 @@ impl Store {
                 branch: r.branch,
                 commit: r.commit,
                 note: r.note,
+                note_group: r
+                    .restored_from
+                    .as_deref()
+                    .and_then(|source| source.strip_prefix("batch:"))
+                    .and_then(|source| source.split(':').next())
+                    .filter(|id| crate::session::valid_id(id).is_ok())
+                    .map(str::to_owned),
                 changes: r.changes.len(),
                 path: r.path,
                 module: r
@@ -1821,7 +2006,7 @@ mod tests {
             form.paste("2");
             form.commit_input()?;
             FAIL_POINT.with(|p| p.set(point));
-            assert!(form.save().is_err());
+            assert!(form.save_with_note("Test config change").is_err());
             let disk = fs::read_to_string(&path)?;
             assert_eq!(
                 disk,
@@ -1891,15 +2076,15 @@ mod tests {
         f.activate();
         f.paste("2");
         f.commit_input()?;
-        assert!(f.save().is_err());
+        assert!(f.save_with_note("Test config change").is_err());
         assert_eq!(fs::read_to_string(&path)?, "# units\ngain: 1\n");
         fs::remove_file(repo.path().join("taid"))?;
         let store = Store::open(&path)?;
         let lock = store.lock()?;
-        assert!(f.save().is_err());
+        assert!(f.save_with_note("Test config change").is_err());
         drop(lock);
         fs::write(&path, "gain: 8\n")?;
-        assert!(f.save().is_err());
+        assert!(f.save_with_note("Test config change").is_err());
         assert_eq!(fs::read_to_string(&path)?, "gain: 8\n");
         assert!(store.list()?.is_empty());
         Ok(())
@@ -1975,7 +2160,7 @@ mod tests {
             f.activate();
             f.paste("2");
             f.commit_input()?;
-            assert!(f.save().is_err());
+            assert!(f.save_with_note("Test config change").is_err());
             assert_eq!(fs::read_to_string(&path)?, "# units\ngain: 1\n");
             assert!(fs::read_dir(other.path())?.next().is_none());
         }
@@ -2026,7 +2211,7 @@ mod tests {
             let mut form = Form::open_in(path.clone(), root)?;
             form.activate();
             form.paste(&(i + 2).to_string());
-            form.save()?;
+            form.save_with_note("Test config change")?;
         }
         let (entries, warnings) = Store::list_global(root, &[])?;
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -2077,7 +2262,7 @@ mod tests {
         let mut old_form = Form::open(path.clone())?;
         old_form.activate();
         old_form.paste("2");
-        old_form.save()?;
+        old_form.save_with_note("Test config change")?;
         let old_store = Store::open(path)?;
         let entry = old_store.list()?.remove(0);
         let mut record = old_store.load(&entry)?;
@@ -2209,7 +2394,7 @@ mod tests {
             form.paste("2");
             form.commit_input()?;
             FAIL_POINT.with(|p| p.set(point));
-            assert!(form.save().is_err());
+            assert!(form.save_with_note("Test config change").is_err());
             let disk = fs::read_to_string(path)?;
             let (all, warnings) = Store::list_global(root, &[])?;
             assert_eq!(all.len(), 1);

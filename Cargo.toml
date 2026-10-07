@@ -13,8 +13,11 @@ publish = false
 [dependencies]
 # TUI stack
 ratatui = "0.29"
-# 0.28 to match the version ratatui 0.29 uses (avoids two crossterm copies)
-crossterm = "0.28"
+# Match ratatui's version. The Unix /dev/tty backend uses level-triggered poll,
+# so simultaneous resize and input readiness cannot strand a queued key.
+# Without it, the default mio backend can lose the TTY readiness edge when it
+# returns a resize event first. Windows keeps its native input backend.
+crossterm = { version = "0.28", features = ["use-dev-tty"] }
 
 # Git operations via vendored libgit2: statically linked into the binary,
 # without ssh/https features. Explicit remote operations use system Git so

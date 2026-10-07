@@ -1,7 +1,7 @@
 //! Rendering: turn [`App`] state into widgets.
 //!
-//! The renderer also registers clickable regions (`Hit` zones) with the app
-//! every frame, so the event loop can route mouse clicks without duplicating
+//! The renderer registers control regions (`Hit` zones) for layout tests
+//! every frame without duplicating
 //! layout math.
 
 use std::borrow::Cow;
@@ -46,7 +46,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 }
 
 /// Full-screen popup for the "not a repository" and error cases, with an
-/// OK button (click or Enter) that exits.
+/// OK button (Enter) that exits.
 fn draw_message_screen(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Paragraph::new(" taid").dim(), area);
@@ -108,7 +108,7 @@ fn draw_message_screen(f: &mut Frame, app: &mut App) {
     }
 
     f.render_widget(
-        Paragraph::new("Enter or click OK")
+        Paragraph::new("Enter to exit")
             .dim()
             .alignment(Alignment::Center),
         rows[2],
@@ -224,15 +224,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn footer_lines(app: &App, width: usize) -> Vec<String> {
+    if app.action_note_editing {
+        return wrap_footer(&["Note: type/paste · Backspace remove · Ctrl+U clear · Enter finish · Esc cancel · Ctrl+Q quit".into()], width);
+    }
     if let Some(review) = &app.batch_review {
         return wrap_footer(
             &[
                 if review.note_editing {
-                    "Restore note: type/paste · Backspace · Ctrl+U clear · Enter/Esc finish"
+                    "Restore note: type/paste · Backspace · Ctrl+U clear · Enter finish · Esc cancel"
                 } else if review.outcome.is_some() {
                     "Enter/Esc/q close result · snapshots retained in local history"
                 } else {
-                    "Enter confirm ALL displayed files · n note · Esc/q cancel without writing"
+                    "n revise note · Enter confirm ALL displayed files · Esc/q cancel"
                 }
                 .into(),
                 "↑↓/kj · PgUp/PgDn · Home/End scroll review · Ctrl+Q quit".into(),
@@ -241,10 +244,8 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
         );
     }
     if let Some(browser) = &app.global_history {
-        let groups = if let Some(input) = &browser.description_input {
-            vec![format!(
-                "Session description: {input}▌ · Enter save · Esc cancel · Backspace · Ctrl+U clear"
-            )]
+        let groups = if browser.description_input.is_some() {
+            vec!["Append session note: type/paste · Enter save · Esc cancel · Backspace · Ctrl+U clear".into()]
         } else if browser.filtering {
             vec![format!(
                 "Find: /{}▌ · Enter keep · Esc clear · Backspace remove · Ctrl+U clear",
@@ -252,10 +253,10 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
             )]
         } else {
             vec![
-                "Enter expand · Backspace up · ↑↓/kj/PgUp/PgDn/Home/End · Tab list/diff".into(),
-                "/ find · f file/all · n description · R reload · w warnings · u recovery".into(),
+                "Enter expand · Backspace up · ↑↓/kj/PgUp/PgDn/Home/End · Tab/Shift+Tab list/changes/notes".into(),
+                "/ find · f file/all · n append note · R reload · w warnings · u recovery".into(),
                 "c current diff · b before/after · r WHOLE row restore · h/Esc/q close".into(),
-                "Ctrl+Q quit · Ctrl+R,R repos · Ctrl+C,C configs · Ctrl+P,P pull".into(),
+                "Ctrl+Q quit · Ctrl+R,R repos · Ctrl+C,C configs · Ctrl+P,P pull all".into(),
             ]
         };
         return wrap_footer(&groups, width);
@@ -263,17 +264,24 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
     let global = if app.network_job.is_some() {
         "Ctrl+X cancel remote operation · Views: Ctrl+R,R repositories · Ctrl+C,C configs"
     } else {
-        "Views: Ctrl+R,R repositories · Ctrl+C,C configs · Ctrl+P,P confirm pull"
+        "Views: Ctrl+R,R repositories · Ctrl+C,C configs · Ctrl+P,P pull all"
     };
     let groups: Vec<String> = if app.popup == Some(Popup::PullConfirm) {
         vec![
-            "Enter/y pull all · Esc/q/n cancel · click Pull/Cancel · Ctrl+Q quit".into(),
+            format!(
+                "Enter/y pull {} · n revise note · Esc/q cancel · Ctrl+Q quit",
+                if app.pull_target.is_some() {
+                    "selected"
+                } else {
+                    "all"
+                }
+            ),
             global.into(),
         ]
     } else if app.save_popup.is_some() {
         vec![
             if matches!(app.save_popup, Some(SaveStage::Confirm(_))) {
-                "Enter apply · Esc/q cancel"
+                "n revise note · Enter apply · Esc/q cancel"
             } else {
                 "Enter/Esc/q close results"
             }
@@ -283,7 +291,8 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
         ]
     } else if app.branch_popup.is_some() {
         vec![
-            "↑↓/kj select · PgUp/PgDn page · Home/End ends · Enter switch · Esc/q close".into(),
+            "↑↓/kj select · PgUp/PgDn page · Home/End ends · f fetch branches · p pull repo · Enter switch & note · Esc/q close"
+                .into(),
             "Ctrl+Q quit".into(),
             global.into(),
         ]
@@ -297,9 +306,9 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
             let text = match overlay {
                 crate::config::Overlay::Save {
                     note_editing: true, ..
-                } => "Note: type/paste · Ctrl+U clear · Enter/Esc finish note",
+                } => "Note: type/paste · Ctrl+U clear · Enter finish · Esc cancel note",
                 crate::config::Overlay::Save { .. } => {
-                    "Enter confirm save · Esc/q return to edits · n optional note · ↑↓/PgUp/PgDn scroll"
+                    "n revise note · Enter confirm save · Esc/q return to edits · ↑↓/PgUp/PgDn scroll"
                 }
                 crate::config::Overlay::History { .. } => {
                     "History: ↑↓/PgUp/PgDn/Home/End · Tab entries/diff · c compare · b before/after · r load restore · Esc/q close"
@@ -320,7 +329,7 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
         } else {
             vec![
                 "↑↓/kj choose · PgUp/PgDn page · Home/End ends · / find parameter".into(),
-                "Enter/Space edit or toggle · r reset value · click edit · wheel scroll".into(),
+                "Enter/Space edit or toggle · r reset value".into(),
             ]
         };
         lines.push(
@@ -342,20 +351,15 @@ fn footer_lines(app: &App, width: usize) -> Vec<String> {
             global.into(),
             "Move: ↑↓/kj · PgUp/PgDn · Home/End · Tab/Shift+Tab/←→ panes".into(),
             if app.view == View::Configurations {
-                "Enter edit config · h global history · r refresh · n remote results · ? help · q/Esc/Ctrl+Q quit"
+                "Enter edit config · p pull module · h global history · r refresh · n remote results · ? help · q/Esc/Ctrl+Q quit"
                     .into()
             } else {
-                "Enter pick · / filter · b branch · s save · r refresh".into()
+                "Enter pick · / filter · b branch · s save · p pull selected · r refresh".into()
             },
             if app.view == View::Repositories {
                 "h global history · n remote results · ? help · q/Esc/Ctrl+Q quit".into()
             } else {
-                "Mouse: click select/edit · wheel scroll".into()
-            },
-            if app.view == View::Repositories {
-                "Mouse: click select · wheel scroll".into()
-            } else {
-                String::new()
+                "".into()
             },
         ]
     };
@@ -706,7 +710,9 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
             browser.rows.len(),
             safe_text(&browser.filter),
             safe_text(browser.file_filter.as_deref().unwrap_or("all")),
-            if browser.diff_focus {
+            if browser.notes_focus {
+                "notes"
+            } else if browser.diff_focus {
                 "diff"
             } else {
                 "entries"
@@ -725,7 +731,7 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
         f.render_widget(
             Paragraph::new(ellipsize(&text, rect.width as usize)).style(
                 if idx == browser.scroll.selected() {
-                    selected_style(!browser.diff_focus)
+                    selected_style(!browser.diff_focus && !browser.notes_focus)
                 } else {
                     Style::default()
                 },
@@ -777,6 +783,61 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
         ]),
         rows[2],
     );
+    let panes = if rows[3].width >= 60 {
+        Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)]).split(rows[3])
+    } else {
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[3])
+    };
+    let changes_block = Block::bordered()
+        .title(" Granular changes ")
+        .border_style(pane_border(browser.diff_focus));
+    let changes_area = changes_block.inner(panes[0]);
+    f.render_widget(changes_block, panes[0]);
+    let notes_block = Block::bordered()
+        .title(" Session notes · newest first ")
+        .border_style(pane_border(
+            browser.notes_focus || browser.description_input.is_some(),
+        ));
+    let notes_area = notes_block.inner(panes[1]);
+    f.render_widget(notes_block, panes[1]);
+    app.hit_zones.push((panes[0], Hit::HistoryChanges));
+    app.hit_zones.push((panes[1], Hit::HistoryNotes));
+    app.pane_heights.commits = changes_area.height as usize;
+    let mut notes = Vec::new();
+    if let Some(input) = &browser.description_input {
+        notes.extend(wrapped_note(
+            "New session note · Enter saves",
+            &format!("{input}▌"),
+            notes_area.width,
+        ));
+        browser.notes_scroll = notes
+            .len()
+            .saturating_sub(notes_area.height.max(1) as usize);
+    }
+    for (title, note) in browser.notes() {
+        notes.extend(wrapped_note(&title, &note, notes_area.width));
+    }
+    if notes.is_empty() {
+        notes.extend(wrapped_note(
+            "No notes yet",
+            "Add a note with n when saving a change or while viewing this session.",
+            notes_area.width,
+        ));
+    }
+    browser.notes_scroll = browser.notes_scroll.min(
+        notes
+            .len()
+            .saturating_sub(notes_area.height.max(1) as usize),
+    );
+    f.render_widget(
+        Paragraph::new(
+            notes
+                .into_iter()
+                .skip(browser.notes_scroll)
+                .collect::<Vec<_>>(),
+        ),
+        notes_area,
+    );
     if browser.show_warnings {
         let mut warnings = browser.warnings.clone();
         if let Some(crate::history::HistoryRow::Recovery(i)) = browser.selected_row() {
@@ -795,23 +856,23 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
                 lines
             })
             .wrap(Wrap { trim: false }),
-            rows[3],
+            changes_area,
         );
     } else {
-        match browser.comparison() {
+        match browser.display_comparison() {
             Ok(changes) => {
                 browser.diff_scroll = browser.diff_scroll.min(changes.len().saturating_sub(1));
                 f.render_widget(
                     Paragraph::new(change_lines(&changes, browser.diff_scroll))
                         .wrap(Wrap { trim: false }),
-                    rows[3],
+                    changes_area,
                 );
             }
             Err(e) => f.render_widget(
                 Paragraph::new(format!("Cannot compare: {e:#}"))
                     .fg(WARNING)
                     .wrap(Wrap { trim: false }),
-                rows[3],
+                changes_area,
             ),
         }
     }
@@ -832,8 +893,42 @@ fn draw_global_history(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// Pre-wrap note lines so scrolling counts visible lines, including long tokens.
+fn wrapped_note(title: &str, note: &str, width: u16) -> Vec<Line<'static>> {
+    let width = width.max(1) as usize;
+    let mut lines = Vec::new();
+    for (text, heading) in [(title, true), (note, false)] {
+        for text in wrap_footer(&[safe_text(text)], width) {
+            let mut line = String::new();
+            let mut cells = 0;
+            for grapheme in text.graphemes(true) {
+                let size = UnicodeWidthStr::width(grapheme);
+                if cells + size > width && !line.is_empty() {
+                    lines.push(if heading {
+                        Line::from(line).fg(ACCENT)
+                    } else {
+                        Line::from(line)
+                    });
+                    line = String::new();
+                    cells = 0;
+                }
+                line.push_str(grapheme);
+                cells += size;
+            }
+            lines.push(if heading {
+                Line::from(line).fg(ACCENT)
+            } else {
+                Line::from(line)
+            });
+        }
+    }
+    lines.push(Line::from(""));
+    lines
+}
+
 fn draw_batch_review(f: &mut Frame, app: &mut App, area: Rect) {
     app.hit_zones.clear();
+    let review_root = app.overview.as_ref().unwrap().root.clone();
     let popup = centered_rect(98, 98, area);
     f.render_widget(Clear, popup);
     let review = app.batch_review.as_mut().unwrap();
@@ -900,7 +995,12 @@ fn draw_batch_review(f: &mut Frame, app: &mut App, area: Rect) {
     }
     for repository in &review.repositories {
         lines.extend(change_lines(
-            &crate::repository_history::changes(&repository.before, &repository.after, false),
+            &crate::repository_history::display_changes(
+                &review_root,
+                &repository.before,
+                &repository.after,
+                false,
+            ),
             0,
         ));
     }
@@ -919,7 +1019,7 @@ fn draw_batch_review(f: &mut Frame, app: &mut App, area: Rect) {
         rows[1],
     );
     f.render_widget(Paragraph::new(vec![
-        Line::from(format!("Note{}: {}{}", if review.note_editing { " (editing)" } else { " · n edits" }, safe_text(&review.note), if review.note_editing { "▌" } else { "" })),
+        Line::from(format!("Required note{}: {}{}", if review.note_editing { " (editing)" } else { " · n edits" }, safe_text(&review.note), if review.note_editing { "▌" } else { "" })),
         Line::from("Multi-target writes are not atomic. A partial failure stops further writes and retains a reviewed resume/rollback plan.").fg(WARNING),
     ]).wrap(Wrap { trim: false }),rows[2]);
     let completed = review.outcome.is_some();
@@ -960,7 +1060,7 @@ fn draw_batch_review(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_config_overlay(f: &mut Frame, app: &mut App, area: Rect) {
-    app.hit_zones.clear(); // Only the topmost modal's controls may receive clicks.
+    app.hit_zones.clear(); // Layout tests observe only the topmost modal's controls.
     let popup = centered_rect(96, 96, area);
     f.render_widget(Clear, popup);
     let form = app.form.as_mut().unwrap();
@@ -1008,10 +1108,19 @@ fn draw_config_overlay(f: &mut Frame, app: &mut App, area: Rect) {
                 Paragraph::new(change_lines(changes, *scroll)).wrap(Wrap { trim: false }),
                 rows[1],
             );
-            let text = format!("Note (n): {note}{}", if *note_editing { "▌" } else { "" });
+            let text = format!(
+                "Required note: {note}{}",
+                if *note_editing { "▌" } else { "" }
+            );
             f.render_widget(
                 Paragraph::new(text)
-                    .fg(if *note_editing { ACCENT } else { MUTED })
+                    .fg(if note.trim().is_empty() {
+                        WARNING
+                    } else if *note_editing {
+                        ACCENT
+                    } else {
+                        MUTED
+                    })
                     .wrap(Wrap { trim: false }),
                 rows[2],
             );
@@ -1163,10 +1272,15 @@ fn draw_config_overlay(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_pull_confirmation(f: &mut Frame, app: &mut App, area: Rect) {
-    let popup = centered_fixed(68, 14, area);
+    let note_lines = action_note_lines(app, area.width.saturating_sub(4).min(64));
+    let popup = centered_fixed(68, 14 + note_lines.len().saturating_sub(1) as u16, area);
     f.render_widget(Clear, popup);
     let block = Block::bordered()
-        .title(" Confirm pull ")
+        .title(if app.pull_target.is_some() {
+            " Confirm pull selected repository "
+        } else {
+            " Confirm pull all repositories "
+        })
         .border_style(pane_border(true));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
@@ -1183,30 +1297,34 @@ fn draw_pull_confirmation(f: &mut Frame, app: &mut App, area: Rect) {
         .unwrap_or(0);
     let rows = Layout::vertical([
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(note_lines.len() as u16),
         Constraint::Length(1),
     ])
     .split(inner);
     f.render_widget(
         Paragraph::new(vec![
-            Line::from(format!(
-                "Pull the main repository and {initialized} initialized submodules?"
-            ))
+            Line::from(if let Some(target) = &app.pull_target {
+                format!("Pull only {}?", safe_text(&target.name))
+            } else {
+                format!("Pull the main repository and {initialized} initialized submodules?")
+            })
             .fg(ACCENT),
             Line::from(""),
             Line::from("This fetches remotes and fast-forwards each current branch."),
             Line::from("Dirty, detached or diverged repositories are not overwritten."),
             Line::from("No merges, commits or staged submodule pointers are created."),
             Line::from(""),
-            Line::from("Results are reported separately for every repository.").dim(),
+            Line::from(if app.pull_target.is_some() {
+                "Other repositories will not be fetched or pulled."
+            } else {
+                "Results are reported separately for every repository."
+            })
+            .dim(),
         ])
         .wrap(Wrap { trim: false }),
         rows[0],
     );
-    f.render_widget(
-        Paragraph::new("Enter/y pull all · Esc/q/n cancel").dim(),
-        rows[1],
-    );
+    f.render_widget(Paragraph::new(note_lines).fg(CURRENT), rows[1]);
     let buttons =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(rows[2]);
     draw_button(
@@ -1674,7 +1792,12 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
     };
 
     let list_h = (bp.branches.len() as u16).clamp(1, 12);
-    let mut h = 3 + 1 + list_h + 1; // borders + header + list + hint
+    let note_lines = if app.action_note.is_empty() && !app.action_note_editing {
+        Vec::new()
+    } else {
+        action_note_lines(app, area.width.saturating_sub(4).min(54))
+    };
+    let mut h = 3 + 1 + list_h + 1 + note_lines.len() as u16;
     if bp.notice.is_some() {
         h += 2;
     }
@@ -1697,6 +1820,7 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
     if is_sub {
         constraints.push(Constraint::Length(2));
     }
+    constraints.push(Constraint::Length(note_lines.len() as u16));
     constraints.push(Constraint::Length(1));
     let chunks = Layout::vertical(constraints).split(inner);
     let mut section = 0;
@@ -1714,6 +1838,8 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
         section += 1;
         a
     });
+    let note_area = chunks[section];
+    section += 1;
     let hint_area = chunks[section];
 
     f.render_widget(
@@ -1750,6 +1876,9 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
         } else {
             Span::raw(b.name.clone())
         });
+        if b.is_remote {
+            spans.push(Span::styled(" [remote]", Style::new().fg(WARNING)));
+        }
         let style = if selected {
             selected_style(true)
         } else {
@@ -1772,15 +1901,16 @@ fn draw_branch_popup(f: &mut Frame, app: &mut App) {
             a,
         );
     }
+    f.render_widget(Paragraph::new(note_lines).fg(CURRENT), note_area);
     f.render_widget(
-        Paragraph::new(" Enter switch · Esc close ").style(Style::new().fg(MUTED)),
+        Paragraph::new(" Enter switch · f fetch branches · Esc close ")
+            .style(Style::new().fg(MUTED)),
         hint_area,
     );
 }
 
 /// The save popup (`s`): confirmation listing every planned change, then the
-/// apply result. Clicking Apply/OK/Cancel works; clicks inside the body are
-/// ignored so a stray click cannot cancel or apply anything.
+/// apply result. All controls are keyboard-only.
 fn draw_save_popup(f: &mut Frame, app: &mut App) {
     let area = f.area();
     if area.width < 20 || area.height < 7 {
@@ -1835,7 +1965,8 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
                 constraints.push(Constraint::Length(1));
             }
             constraints.extend(std::iter::repeat_n(Constraint::Length(1), warns.len()));
-            constraints.push(Constraint::Length(1)); // note
+            let note_lines = action_note_lines(app, area.width.saturating_sub(4).min(56));
+            constraints.push(Constraint::Length(note_lines.len() as u16));
             constraints.push(Constraint::Length(1)); // buttons
 
             let title = if n == 1 {
@@ -1843,7 +1974,11 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
             } else {
                 format!(" Save — apply {n} changes? ")
             };
-            let popup = centered_fixed(60, constraints.len() as u16 + 2, area);
+            let popup = centered_fixed(
+                60,
+                constraints.len() as u16 + 2 + note_lines.len().saturating_sub(1) as u16,
+                area,
+            );
             f.render_widget(Clear, popup);
             let block = Block::bordered()
                 .title(title)
@@ -1891,10 +2026,7 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
                 );
                 r += 1;
             }
-            f.render_widget(
-                Paragraph::new("nothing is committed or pushed — pointers are only staged").dim(),
-                rows[r],
-            );
+            f.render_widget(Paragraph::new(note_lines).fg(CURRENT), rows[r]);
             r += 1;
 
             if rows[r].height > 0 {
@@ -2022,6 +2154,29 @@ fn draw_save_popup(f: &mut Frame, app: &mut App) {
     }
 }
 
+fn action_note_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    if app.action_note.is_empty() && !app.action_note_editing {
+        return vec![
+            Line::from("Note required · Enter opens input (1–500 characters)").fg(WARNING),
+        ];
+    }
+    let text = format!(
+        "Note: {}{}",
+        app.action_note,
+        if app.action_note_editing { "▌" } else { "" }
+    );
+    let mut lines = wrapped_note("", &text, width);
+    lines.pop();
+    lines
+        .into_iter()
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
+}
+
 /// Horizontal placement of a popup button inside its row.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ButtonPos {
@@ -2077,16 +2232,20 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = &[
         ("Ctrl+R,R / Ctrl+C,C", "repositories / configurations"),
         ("Ctrl+P,P", "confirm fetch and fast-forward all repos"),
+        ("p", "pull only selected repository/module"),
         ("↑ ↓ / k j", "move selection"),
         ("PgUp PgDn / Home End", "scroll by page / first-last"),
         ("Tab / Shift+Tab", "switch pane (repos ↔ commits)"),
         ("Enter", "pick / un-pick recorded commit"),
-        ("b", "switch branch of repo/submodule"),
+        ("b", "local/remote branch picker (f fetches)"),
         ("s", "save: apply picked commits"),
+        (
+            "Notes open on save",
+            "type; Enter finish, Enter confirm; Esc cancel; n revise",
+        ),
         ("r", "refresh repository state"),
         ("n", "remote results (↑↓ to scroll)"),
         ("/", "filter commits by title or SHA"),
-        ("click / wheel", "select rows, focus panes, scroll"),
         ("?", "toggle this help"),
         ("q / Esc", "quit (or close a popup)"),
         ("Ctrl+Q", "quit (protects unsaved edits)"),
@@ -2102,6 +2261,10 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         (
             "History browsing",
             "/ find; f file/all; n session note; R reload; w warnings; u recovery",
+        ),
+        (
+            "History panes",
+            "Tab/Shift+Tab entries/changes/notes; ↑↓ scroll",
         ),
         (
             "History restoring",
@@ -2292,14 +2455,14 @@ mod tests {
     fn repository_only_history_shows_branch_diff_and_safe_restore_review_at_all_sizes() {
         let (mut app, _temp) = make_branchy_app();
         app.handle_key(key(KeyCode::Char('b')));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Char('h')));
         let text = screen_text(&render(&mut app, 100, 32));
         assert!(text.contains("Global session history"));
         assert!(text.contains("branch / checkout commit"));
         assert!(text.contains("− main @") && text.contains("+ feature @"));
         assert!(app.global_history.as_ref().unwrap().entries.is_empty());
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Char('b')));
         app.handle_key(key(KeyCode::Char('r')));
         let text = screen_text(&render(&mut app, 100, 32));
@@ -2320,6 +2483,102 @@ mod tests {
             app.repo.as_ref().unwrap().head().unwrap().shorthand(),
             Some("feature")
         );
+    }
+
+    #[test]
+    fn session_notes_have_a_separate_pane_and_scroll_without_moving_changes() {
+        let (mut app, _temp) = make_branchy_app();
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('n')));
+        app.handle_paste(&format!("{}TAILλ", "steering ".repeat(45)));
+        crate::fixture::confirm_action(&mut app);
+        crate::fixture::confirm_action(&mut app);
+        app.handle_key(key(KeyCode::Char('h')));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(
+            text.contains("Granular changes") && text.contains("Session notes"),
+            "{text}"
+        );
+        assert!(text.contains("steering"), "{text}");
+        assert!(text.contains("branch / checkout commit"), "{text}");
+        let notes_rect = app
+            .hit_zones
+            .iter()
+            .find(|(_, hit)| *hit == Hit::HistoryNotes)
+            .unwrap()
+            .0;
+        let changes_rect = app
+            .hit_zones
+            .iter()
+            .find(|(_, hit)| *hit == Hit::HistoryChanges)
+            .unwrap()
+            .0;
+        assert!(changes_rect.x + changes_rect.width <= notes_rect.x);
+        app.handle_mouse(click(notes_rect.x + 1, notes_rect.y + 1));
+        assert!(!app.global_history.as_ref().unwrap().notes_focus);
+        app.handle_key(key(KeyCode::BackTab));
+        app.handle_key(key(KeyCode::End));
+        let text = screen_text(&render(&mut app, 90, 26));
+        assert!(
+            text.contains("TAILλ"),
+            "tail of wrapped note can be reached: {text}"
+        );
+        let browser = app.global_history.as_ref().unwrap();
+        assert!(browser.notes_focus && browser.notes_scroll > 0);
+        assert_eq!(browser.scroll.selected(), 0);
+        assert_eq!(browser.diff_scroll, 0);
+        app.handle_key(key(KeyCode::Home));
+        assert_eq!(app.global_history.as_ref().unwrap().notes_scroll, 0);
+        app.handle_key(key(KeyCode::BackTab));
+        assert!(app.global_history.as_ref().unwrap().diff_focus);
+        app.handle_key(key(KeyCode::Tab));
+        assert!(app.global_history.as_ref().unwrap().notes_focus);
+        for (w, h) in [(1, 1), (8, 3), (40, 12), (80, 24)] {
+            render(&mut app, w, h);
+        }
+    }
+
+    #[test]
+    fn history_changes_and_restore_review_show_short_commit_hashes_and_titles() {
+        let (mut app, _temp) = make_branchy_app();
+        let commit = app
+            .repo
+            .as_ref()
+            .unwrap()
+            .head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap();
+        let full = commit.id().to_string();
+        let description = format!("{} · {}", &full[..7], commit.summary().unwrap());
+        drop(commit);
+        app.handle_key(key(KeyCode::Char('b')));
+        crate::fixture::confirm_action(&mut app);
+        app.handle_key(key(KeyCode::Char('h')));
+        let buffer = render(&mut app, 180, 40);
+        let rect = app
+            .hit_zones
+            .iter()
+            .find_map(|(rect, hit)| (*hit == Hit::HistoryChanges).then_some(*rect))
+            .unwrap();
+        let text = (rect.y..rect.bottom())
+            .map(|y| {
+                (rect.x..rect.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains(&description), "{text}");
+        assert!(!text.contains(&full), "changes use abbreviated IDs: {text}");
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(key(KeyCode::Char('r')));
+        let text = screen_text(&render(&mut app, 180, 40));
+        assert!(
+            text.contains(&description),
+            "restore preview uses the same display: {text}"
+        );
+        assert!(!text.contains(&full));
     }
 
     fn screen_text(buf: &ratatui::buffer::Buffer) -> String {
@@ -2408,12 +2667,12 @@ mod tests {
         assert!(text.contains("This directory is not a git repository"));
         assert!(text.contains("/some/dir"));
         assert!(text.contains("[ OK ]"));
-        assert!(text.contains("Enter or click OK"));
+        assert!(text.contains("Enter to exit"));
         assert!(app.hit_zones.iter().any(|(_, h)| *h == Hit::OkButton));
     }
 
     #[test]
-    fn clicking_rendered_ok_button_quits() {
+    fn mouse_ok_is_ignored_and_enter_quits() {
         let mut app = App::not_repo(Path::new("/x"));
         render(&mut app, 80, 24);
         let (rect, _) = app
@@ -2423,6 +2682,8 @@ mod tests {
             .copied()
             .unwrap();
         app.handle_mouse(click(rect.x + rect.width / 2, rect.y));
+        assert!(!app.should_quit);
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.should_quit);
     }
 
@@ -2485,7 +2746,7 @@ mod tests {
         app.select_repo(1); // subA
         app.focus = Focus::Commits;
         app.handle_key(key(KeyCode::Down)); // older commit (a1)
-        app.handle_key(key(KeyCode::Enter)); // pick it
+        crate::fixture::confirm_action(&mut app); // pick it
 
         let buf = render(&mut app, 100, 30);
         let text = screen_text(&buf);
@@ -2516,7 +2777,7 @@ mod tests {
     }
 
     #[test]
-    fn config_view_mouse_form_validation_and_wrapped_shortcuts_render() {
+    fn config_view_keyboard_form_validation_and_wrapped_shortcuts_render() {
         let (mut app, temp) = make_normal_app();
         let path = temp.path().join("super/subA/controller/config/gains.yaml");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -2545,6 +2806,9 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ConfigFile(0)).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(rect.x + 1, rect.y));
+        assert!(app.form.is_none());
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             app.form.as_ref().unwrap().path,
             path.canonicalize().unwrap()
@@ -2565,13 +2829,14 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ParameterRow(0)).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(rect.x + 1, rect.y));
-        app.handle_paste("invalid number");
         app.handle_key(key(KeyCode::Enter));
+        app.handle_paste("invalid number");
+        crate::fixture::confirm_action(&mut app);
         assert!(app.form.as_ref().unwrap().editing.is_some());
         let text = screen_text(&render(&mut app, 80, 24));
         assert!(text.contains("whole number"), "{text}");
         app.handle_key(key(KeyCode::Esc));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Char('3')));
         render(&mut app, 80, 24);
         let save = app
@@ -2580,6 +2845,7 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ParameterSave).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(save.x + 1, save.y));
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         let text = screen_text(&render(&mut app, 80, 24));
         assert!(text.contains("Review config save"), "{text}");
         assert_eq!(
@@ -2592,6 +2858,14 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ConfigConfirm).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(confirm.x, confirm.y));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "# controller\ngain: 1\n"
+        );
+        app.handle_paste("Config click test");
+        app.handle_key(key(KeyCode::Enter)); // finish required note
+        app.handle_mouse(click(confirm.x, confirm.y));
+        app.handle_key(key(KeyCode::Enter));
         assert_eq!(
             std::fs::read_to_string(app.form.as_ref().unwrap().path.clone()).unwrap(),
             "# controller\ngain: 3\n"
@@ -2606,7 +2880,7 @@ mod tests {
         std::fs::write(&path, "gain: 1\n").unwrap();
         app.view = View::Configurations;
         app.form = Some(crate::config::Form::open(path.clone()).unwrap());
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_paste("2");
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         let text = screen_text(&render(&mut app, 100, 36));
@@ -2616,10 +2890,10 @@ mod tests {
         for (w, h) in [(1, 1), (8, 3), (20, 10)] {
             render(&mut app, w, h);
         }
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         app.handle_key(key(KeyCode::Char('h')));
-        app.handle_key(key(KeyCode::Enter)); // session → files
-        app.handle_key(key(KeyCode::Enter)); // file → individual saves
+        crate::fixture::confirm_action(&mut app); // session → files
+        crate::fixture::confirm_action(&mut app); // file → individual saves
         let text = screen_text(&render(&mut app, 100, 36));
         assert!(text.contains("Global session history") && text.contains("never pushed"));
         assert!(text.contains("previous → saved"));
@@ -2642,10 +2916,11 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::HistoryRestore).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(restore.x, restore.y));
+        app.handle_key(key(KeyCode::Char('r')));
         assert!(app.form.as_ref().unwrap().dirty());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "gain: 2\n");
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "gain: 1\n");
         assert_eq!(
             crate::history::Store::open_in(&path, &app.overview.as_ref().unwrap().root)
@@ -2658,7 +2933,7 @@ mod tests {
     }
 
     #[test]
-    fn session_restore_review_is_modal_lists_all_files_and_requires_mouse_confirmation() {
+    fn session_restore_review_is_modal_and_requires_keyboard_confirmation() {
         let (mut app, temp) = make_normal_app();
         let root = temp.path().join("super").canonicalize().unwrap();
         let paths = [
@@ -2669,15 +2944,15 @@ mod tests {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, "gain: 1\n").unwrap();
             app.form = Some(crate::config::Form::open_in(path.clone(), &root).unwrap());
-            app.handle_key(key(KeyCode::Enter));
+            crate::fixture::confirm_action(&mut app);
             app.handle_paste(value);
             app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
-            app.handle_key(key(KeyCode::Enter));
+            crate::fixture::confirm_action(&mut app);
         }
         app.handle_key(key(KeyCode::Char('h')));
         app.handle_key(key(KeyCode::Char('n')));
         app.handle_paste("Dry test");
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         let text = screen_text(&render(&mut app, 100, 32));
         assert!(text.contains("Dry test"));
         assert!(text.contains("2 modules / 2 files / 2 saves"));
@@ -2703,6 +2978,8 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ConfigCancel).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(cancel.x, cancel.y));
+        assert!(app.batch_review.is_some());
+        app.handle_key(key(KeyCode::Esc));
         assert!(app.batch_review.is_none());
         assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "gain: 2\n");
         app.handle_key(key(KeyCode::Char('r')));
@@ -2713,6 +2990,12 @@ mod tests {
             .find_map(|(rect, hit)| (*hit == Hit::ConfigConfirm).then_some(*rect))
             .unwrap();
         app.handle_mouse(click(confirm.x, confirm.y));
+        assert!(app.batch_review.as_ref().unwrap().note_editing);
+        assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "gain: 2\n");
+        app.handle_paste("Restore click test");
+        app.handle_key(key(KeyCode::Enter)); // finish required note
+        app.handle_mouse(click(confirm.x, confirm.y));
+        app.handle_key(key(KeyCode::Enter));
         assert!(
             app.batch_review
                 .as_ref()
@@ -2726,7 +3009,7 @@ mod tests {
         assert!(text.contains("Session restore result"));
         assert_eq!(std::fs::read_to_string(&paths[0]).unwrap(), "gain: 1\n");
         assert_eq!(std::fs::read_to_string(&paths[1]).unwrap(), "gain: 1\n");
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         assert!(app.batch_review.is_none());
         assert_eq!(app.global_history.as_ref().unwrap().entries.len(), 4);
     }
@@ -2781,7 +3064,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_rendered_repo_row_selects_it() {
+    fn rendered_repo_row_ignores_clicks() {
         let (mut app, _t) = make_normal_app();
         render(&mut app, 80, 24);
 
@@ -2793,12 +3076,15 @@ mod tests {
             .unwrap();
         app.handle_mouse(click(rect.x + 2, rect.y));
 
-        assert_eq!(app.repos.selected(), 2);
+        assert_eq!(app.repos.selected(), 0);
         assert_eq!(app.focus, Focus::Repos);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.repos.selected(), 2);
     }
 
     #[test]
-    fn clicking_rendered_commit_row_selects_it() {
+    fn rendered_commit_row_ignores_clicks() {
         let (mut app, _t) = make_normal_app();
         render(&mut app, 80, 24);
 
@@ -2810,12 +3096,15 @@ mod tests {
             .unwrap();
         app.handle_mouse(click(rect.x + 2, rect.y));
 
-        assert_eq!(app.focus, Focus::Commits);
+        assert_eq!(app.focus, Focus::Repos);
+        assert_eq!(app.entries[0].scroll.selected(), 0);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.entries[0].scroll.selected(), 1);
     }
 
     #[test]
-    fn help_popup_renders_keys_and_dismisses_on_click() {
+    fn help_popup_renders_keys_and_ignores_clicks() {
         let (mut app, _t) = make_normal_app();
         app.popup = Some(Popup::Help);
         let buf = render(&mut app, 80, 24);
@@ -2826,6 +3115,8 @@ mod tests {
         assert!(text.contains("Ctrl+P,P"));
 
         app.handle_mouse(click(40, 12));
+        assert_eq!(app.popup, Some(Popup::Help));
+        app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.popup, None);
     }
 
@@ -2838,7 +3129,7 @@ mod tests {
         assert!(text.contains("Confirm pull"));
         assert!(text.contains("fast-forwards"));
         assert!(text.contains("[ Pull ]") && text.contains("[ Cancel ]"));
-        assert!(text.contains("Enter/y pull all"));
+        assert!(text.contains("Note: type/paste"));
         assert!(
             app.hit_zones
                 .iter()
@@ -2856,9 +3147,41 @@ mod tests {
             "outside clicks cannot pull"
         );
         app.handle_mouse(click(cancel.x, cancel.y));
+        assert_eq!(app.popup, Some(Popup::PullConfirm));
+        app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.popup, None);
         assert!(app.network_job.is_none());
         app.popup = Some(Popup::PullConfirm);
+        for (width, height) in [(1, 1), (8, 3), (12, 5), (30, 10)] {
+            render(&mut app, width, height);
+        }
+    }
+
+    #[test]
+    fn selected_pull_confirmation_names_its_target_and_all_pull_remains_available() {
+        let (mut app, _temp) = make_normal_app();
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("p pull selected") && text.contains("Ctrl+P,P pull all"));
+        app.select_repo(1);
+        app.handle_key(key(KeyCode::Char('p')));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Confirm pull selected repository"));
+        assert!(text.contains("Pull only subA?"));
+        assert!(text.contains("Other repositories will not be fetched or pulled."));
+        assert!(text.contains("Note: type/paste"));
+        assert!(!text.contains("Pull the main repository"));
+        app.handle_paste("Update just steering");
+        app.handle_key(key(KeyCode::Enter));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Enter/y pull selected"));
+        assert!(app.network_job.is_none());
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Char('p')));
+        let text = screen_text(&render(&mut app, 100, 32));
+        assert!(text.contains("Confirm pull all repositories"));
+        assert!(text.contains("Pull the main repository"));
+        assert!(app.action_note.is_empty() && app.action_note_editing);
         for (width, height) in [(1, 1), (8, 3), (12, 5), (30, 10)] {
             render(&mut app, width, height);
         }
@@ -2894,7 +3217,7 @@ mod tests {
     }
 
     #[test]
-    fn clicking_rendered_branch_row_switches() {
+    fn rendered_branch_row_ignores_click_and_enter_prompts_for_note() {
         let (mut app, _t) = make_branchy_app();
         app.handle_key(key(KeyCode::Char('b')));
         render(&mut app, 80, 24);
@@ -2907,6 +3230,13 @@ mod tests {
             .copied()
             .unwrap();
         app.handle_mouse(click(rect.x + 3, rect.y));
+        assert!(!app.action_note_editing);
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.action_note_editing);
+        app.handle_paste("Branch click test");
+        app.handle_key(key(KeyCode::Enter)); // finish required note
+        app.handle_mouse(click(rect.x + 3, rect.y));
+        app.handle_key(key(KeyCode::Enter));
 
         assert!(app.branch_popup.is_none(), "popup closed after switch");
         assert_eq!(
@@ -2922,7 +3252,7 @@ mod tests {
         app.select_repo(1);
         app.focus = Focus::Commits;
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         std::fs::write(temp.path().join("super/subA/untracked.txt"), "x").unwrap();
         app.handle_key(key(KeyCode::Char('s')));
 
@@ -2935,7 +3265,7 @@ mod tests {
         assert!(text.contains('⚠'), "dirty warning: {text}");
         assert!(text.contains("[ Apply ]"));
         assert!(text.contains("[ Cancel ]"));
-        assert!(text.contains("nothing is committed or pushed"));
+        assert!(text.contains("Note: ▌"));
 
         // Both buttons registered as hit zones.
         assert!(app.hit_zones.iter().any(|(_, h)| *h == Hit::SaveApply));
@@ -2943,12 +3273,12 @@ mod tests {
     }
 
     #[test]
-    fn clicking_apply_button_applies_and_shows_result() {
+    fn keyboard_apply_button_applies_and_shows_result() {
         let (mut app, _t) = make_normal_app();
         app.select_repo(1);
         app.focus = Focus::Commits;
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Enter));
+        crate::fixture::confirm_action(&mut app);
         let pick = app.entries[1].pick.unwrap();
         app.handle_key(key(KeyCode::Char('s')));
         render(&mut app, 80, 24);
@@ -2960,6 +3290,11 @@ mod tests {
             .copied()
             .unwrap();
         app.handle_mouse(click(rect.x + 2, rect.y));
+        assert!(app.action_note_editing);
+        app.handle_paste("Commit click test");
+        app.handle_key(key(KeyCode::Enter)); // finish required note
+        app.handle_mouse(click(rect.x + 2, rect.y));
+        app.handle_key(key(KeyCode::Enter));
 
         match &app.save_popup {
             Some(SaveStage::Result(outcome)) => {
@@ -2986,6 +3321,8 @@ mod tests {
             .copied()
             .unwrap();
         app.handle_mouse(click(ok.x + 2, ok.y));
+        assert!(app.save_popup.is_some());
+        app.handle_key(key(KeyCode::Enter));
         assert!(app.save_popup.is_none());
     }
 
